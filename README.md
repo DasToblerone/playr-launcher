@@ -39,18 +39,27 @@ Bei schmalem Fenster zeigt das Tool eine Liste. Wird das Fenster breit genug, et
 
 ## Windows meldet Smart App Control oder SmartScreen
 
-Die Releases sind noch nicht mit einem Zertifikat signiert. Windows' Smart App Control blockt unsignierte Programme ohne Ruf, und dafür gibt es keine Ausnahme pro Programm. Bis es eine Signatur gibt, hast du zwei Möglichkeiten:
+Die Releases sind noch nicht mit einem Zertifikat signiert, deshalb warnt Windows.
 
-- Das Tool selbst bauen, die Anleitung steht unten. Selbst gebaute Programme wirft Smart App Control allerdings auch hinaus, wenn sie unsigniert sind. Dann hilft nur das Ausschalten von Smart App Control (Windows-Sicherheit, App- und Browsersteuerung), das sich danach nicht wieder einschalten lässt.
-- Bei SmartScreen („Der Computer wurde durch Windows geschützt“) auf „Weitere Informationen“ und dann „Trotzdem ausführen“ klicken.
+- **SmartScreen** („Der Computer wurde durch Windows geschützt“): auf „Weitere Informationen“ und dann „Trotzdem ausführen“ klicken. Alternativ das Tool selbst bauen, siehe unten, denn eine selbst gebaute Datei trägt keine Download-Markierung und löst die Warnung nicht aus.
+- **Smart App Control** blockt unsignierte Programme ohne Ruf und hat keine Ausnahme pro Programm. Auch eine selbst gebaute exe ist unsigniert und wird dort meist ebenfalls blockiert. Dann hilft nur, Smart App Control in der Windows-Sicherheit unter „App- und Browsersteuerung“ auszuschalten.
 
 ## Datenschutz
 
 Das Tool sendet keine persönlichen Daten und hat keine Telemetrie. Es liest nur Dateien von Steam auf deinem Rechner und fragt Steams öffentliche Server nach Titelbildern und danach, ob eine App ein Spiel ist.
 
-## Bauen
+## Selbst bauen
 
-Windows, Visual Studio mit C++-Werkzeugen (Developer Command Prompt):
+Du brauchst Windows 10 oder 11 und den C++-Compiler von Microsoft. Das Tool hat keine weiteren Abhängigkeiten.
+
+1. **Compiler installieren** (einmalig, etwa 3 GB). Entweder die „Build Tools für Visual Studio“ von [visualstudio.microsoft.com](https://visualstudio.microsoft.com/downloads/) mit dem Workload „Desktopentwicklung mit C++“, oder in einer Eingabeaufforderung:
+   ```
+   winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+   ```
+2. **Quellcode holen:** auf GitHub „Code“, dann „Download ZIP“ und entpacken. Mit Git geht auch `git clone https://github.com/DasToblerone/steam-game-randomizer`.
+3. **`build.bat` doppelklicken.** Das Skript findet Visual Studio selbst und baut die exe, nach etwa einer halben Minute liegt `SteamGameRandomizer.exe` im selben Ordner.
+
+Fehlt der Compiler, sagt das Skript es dir und nennt den Installationsbefehl. Wer die Befehle selbst eingeben will, öffnet die „x64 Native Tools Command Prompt für VS“ im Ordner des Quellcodes:
 
 ```
 rc /nologo SteamGameRandomizer.rc
