@@ -39,14 +39,14 @@ Bei schmalem Fenster zeigt das Tool eine Liste. Wird das Fenster breit genug, et
 
 ## Windows meldet Smart App Control oder SmartScreen
 
-Die Releases sind noch nicht mit einem Zertifikat signiert. Windows' Smart App Control blockt unsignierte Programme ohne Ruf, und dafür gibt es keine Ausnahme pro Programm. Die Signatur ist in Arbeit, siehe [CODE_SIGNING.md](CODE_SIGNING.md). Bis dahin hast du zwei Möglichkeiten:
+Die Releases sind noch nicht mit einem Zertifikat signiert. Windows' Smart App Control blockt unsignierte Programme ohne Ruf, und dafür gibt es keine Ausnahme pro Programm. Bis es eine Signatur gibt, hast du zwei Möglichkeiten:
 
 - Das Tool selbst bauen, die Anleitung steht unten. Selbst gebaute Programme wirft Smart App Control allerdings auch hinaus, wenn sie unsigniert sind. Dann hilft nur das Ausschalten von Smart App Control (Windows-Sicherheit, App- und Browsersteuerung), das sich danach nicht wieder einschalten lässt.
 - Bei SmartScreen („Der Computer wurde durch Windows geschützt“) auf „Weitere Informationen“ und dann „Trotzdem ausführen“ klicken.
 
 ## Datenschutz
 
-Das Tool sendet keine persönlichen Daten und hat keine Telemetrie. Es liest nur Dateien von Steam auf deinem Rechner und fragt Steams öffentliche Server nach Titelbildern und danach, ob eine App ein Spiel ist. Details stehen in [CODE_SIGNING.md](CODE_SIGNING.md).
+Das Tool sendet keine persönlichen Daten und hat keine Telemetrie. Es liest nur Dateien von Steam auf deinem Rechner und fragt Steams öffentliche Server nach Titelbildern und danach, ob eine App ein Spiel ist.
 
 ## Bauen
 

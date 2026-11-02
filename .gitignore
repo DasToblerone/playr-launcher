@@ -4,3 +4,6 @@
 *.obj
 *.png
 LICENSE
+CODE_SIGNING.md
+.github/
+.signpath/
