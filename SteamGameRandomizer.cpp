@@ -884,9 +884,36 @@ ArtCache g_headers, g_portraits;
 Bitmap* GetCover(const std::wstring& appId) { return g_headers.Get(appId, CoverPath(appId)); }
 Bitmap* GetPortrait(const std::wstring& appId) { return g_portraits.Get(appId, PortraitPath(appId)); }
 
+// Art scaled once to the size it is drawn at, with rounded corners, so painting only has to blit it.
+// Scaling the full-size images on every repaint made hovering over many cards feel laggy.
+struct BakedArt {
+    int w = 0, h = 0;
+    Bitmap* bitmap = nullptr;
+};
+using BakedCache = std::map<unsigned long long, BakedArt>;
+BakedCache g_bakedRows, g_bakedCards;
+
+void ForgetBaked(unsigned long long id) {
+    for (BakedCache* cache : { &g_bakedRows, &g_bakedCards }) {
+        auto it = cache->find(id);
+        if (it == cache->end()) continue;
+        delete it->second.bitmap;
+        cache->erase(it);
+    }
+}
+
+void ClearBaked() {
+    for (BakedCache* cache : { &g_bakedRows, &g_bakedCards }) {
+        for (auto& entry : *cache) delete entry.second.bitmap;
+        cache->clear();
+    }
+}
+
 void OnCoverDownloaded(HWND hwnd, unsigned long long id) {
-    if (id & kPortraitFlag) g_portraits.Forget(id & ~kPortraitFlag);
-    else g_headers.Forget(id);
+    unsigned long long appId = id & ~kPortraitFlag;
+    if (id & kPortraitFlag) g_portraits.Forget(appId);
+    else g_headers.Forget(appId);
+    ForgetBaked(appId);
     Redraw(hwnd);
 }
 
@@ -922,11 +949,48 @@ void StrokePill(Graphics& g, RectF r, const Color& color, REAL width, bool dashe
     g.DrawPath(&pen, &path);
 }
 
+// Creating fonts is slow, and a repaint draws dozens of labels, so they are created once per size.
+const Font& CachedFont(REAL px, bool bold) {
+    static FontFamily family(L"Arial");
+    static std::map<std::pair<int, bool>, std::unique_ptr<Font>> fonts;
+    auto& font = fonts[{ (int)std::lround(px * 10), bold }];
+    if (!font) font = std::make_unique<Font>(&family, px, bold ? FontStyleBold : FontStyleRegular, UnitPixel);
+    return *font;
+}
+
+// Scales `source` to w x h with rounded corners; `crop` fills the box with the middle of the image.
+Bitmap* BakeArt(Bitmap* source, int w, int h, REAL radius, bool crop) {
+    Bitmap* baked = new Bitmap(w, h, PixelFormat32bppPARGB);
+    Graphics g(baked);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.SetPixelOffsetMode(PixelOffsetModeHalf);
+    GraphicsPath clip;
+    RoundPath(clip, RectF(0, 0, (REAL)w, (REAL)h), radius);
+    g.SetClip(&clip);
+    RectF dest(0, 0, (REAL)w, (REAL)h);
+    if (crop) {
+        REAL sourceH = (REAL)source->GetHeight(), sourceW = sourceH * w / h;
+        g.DrawImage(source, dest, ((REAL)source->GetWidth() - sourceW) / 2, 0, sourceW, sourceH, UnitPixel);
+    } else {
+        g.DrawImage(source, dest);
+    }
+    return baked;
+}
+
+Bitmap* GetBaked(BakedCache& cache, const std::wstring& appId, Bitmap* source, int w, int h, REAL radius, bool crop) {
+    BakedArt& entry = cache[wcstoull(appId.c_str(), nullptr, 10)];
+    if (!entry.bitmap || entry.w != w || entry.h != h) {
+        delete entry.bitmap;
+        entry = { w, h, BakeArt(source, w, h, radius, crop) };
+    }
+    return entry.bitmap;
+}
+
 // `wrap` lets the text use as many lines as the rectangle holds and ends the last one with an ellipsis.
 void DrawLabel(Graphics& g, const std::wstring& text, REAL px, bool bold, const Color& color, RectF r,
     StringAlignment h = StringAlignmentNear, StringAlignment v = StringAlignmentNear, bool wrap = false) {
-    FontFamily family(L"Arial");
-    Font font(&family, px, bold ? FontStyleBold : FontStyleRegular, UnitPixel);
+    const Font& font = CachedFont(px, bold);
     StringFormat format;
     format.SetAlignment(h);
     format.SetLineAlignment(v);
@@ -949,10 +1013,8 @@ void DrawPlayTriangle(Graphics& g, REAL cx, REAL cy, REAL size, const Color& col
 
 // Spinner, animated check mark or text, centered in a button.
 void DrawBadge(Graphics& g, RectF r, const Badge& badge, const Color& ink = kText, const Color& accent = kAccentHover) {
-    FontFamily family(L"Arial");
-    Font font(&family, (REAL)S(13), FontStyleBold, UnitPixel);
     RectF box;
-    g.MeasureString(badge.text.c_str(), -1, &font, PointF(0, 0), &box);
+    g.MeasureString(badge.text.c_str(), -1, &CachedFont((REAL)S(13), true), PointF(0, 0), &box);
     bool hasIcon = badge.mode == Badge::Spinner || badge.mode == Badge::Check;
     REAL icon = hasIcon ? (REAL)S(16) : 0.0f, gap = hasIcon ? (REAL)S(6) : 0.0f, textW = box.Width - S(8);
     REAL startX = r.X + (r.Width - (icon + gap + textW)) / 2;
@@ -1024,22 +1086,28 @@ std::wstring Plural(long long n, const wchar_t* one, const wchar_t* many) {
     return std::to_wstring(n) + L" " + (n == 1 ? one : many);
 }
 
-// "36 Std. · Zuletzt gespielt vor 3 Tagen"
-std::wstring PlayInfo(const Game& game) {
-    if (game.playtimeMinutes == 0 && game.lastPlayed == 0) return L"Noch nicht gespielt";
+struct PlayParts {
+    std::wstring playtime;  // "36 Std."
+    std::wstring when;      // "vor 3 Tagen"
+};
 
-    std::wstring parts;
+PlayParts PlayStats(const Game& game) {
+    PlayParts parts;
+    if (game.playtimeMinutes == 0 && game.lastPlayed == 0) {
+        parts.playtime = L"Noch nicht gespielt";
+        return parts;
+    }
     if (game.playtimeMinutes > 0) {
         if (game.playtimeMinutes < 60) {
-            parts = std::to_wstring(game.playtimeMinutes) + L" Min.";
+            parts.playtime = std::to_wstring(game.playtimeMinutes) + L" Min.";
         } else if (game.playtimeMinutes < 600) {
             wchar_t hours[32];
             swprintf_s(hours, L"%.1f", game.playtimeMinutes / 60.0);
             std::wstring text = hours;
             std::replace(text.begin(), text.end(), L'.', L',');
-            parts = text + L" Std.";
+            parts.playtime = text + L" Std.";
         } else {
-            parts = std::to_wstring(game.playtimeMinutes / 60) + L" Std.";
+            parts.playtime = std::to_wstring(game.playtimeMinutes / 60) + L" Std.";
         }
     }
     if (game.lastPlayed > 0) {
@@ -1051,10 +1119,17 @@ std::wstring PlayInfo(const Game& game) {
         else if (days < 60) when = L"vor " + std::to_wstring(days / 7) + L" Wochen";
         else if (days < 365) when = L"vor " + std::to_wstring(days / 30) + L" Monaten";
         else when = L"vor " + Plural(days / 365, L"Jahr", L"Jahren");
-        if (!parts.empty()) parts += L"  ·  ";
-        parts += L"Zuletzt gespielt " + when;
+        parts.when = when;
     }
     return parts;
+}
+
+// "36 Std. · Zuletzt gespielt vor 3 Tagen", for the one-line list rows
+std::wstring PlayInfo(const Game& game) {
+    PlayParts parts = PlayStats(game);
+    if (parts.when.empty()) return parts.playtime;
+    std::wstring last = L"Zuletzt gespielt " + parts.when;
+    return parts.playtime.empty() ? last : parts.playtime + L"  ·  " + last;
 }
 
 void DrawRow(Graphics& g, int visibleIndex, int W) {
@@ -1074,10 +1149,8 @@ void DrawRow(Graphics& g, int visibleIndex, int W) {
     GraphicsPath clip;
     RoundPath(clip, cover, (REAL)S(5));
     if (Bitmap* bitmap = GetCover(game.appId)) {
-        GraphicsState state = g.Save();
-        g.SetClip(&clip, CombineModeIntersect);
-        g.DrawImage(bitmap, cover);
-        g.Restore(state);
+        Bitmap* baked = GetBaked(g_bakedRows, game.appId, bitmap, (int)cover.Width, (int)cover.Height, (REAL)S(5), false);
+        g.DrawImage(baked, Rect((int)cover.X, (int)cover.Y, (int)cover.Width, (int)cover.Height));
     } else {
         SolidBrush brush(kCover);
         g.FillPath(&brush, &clip);
@@ -1112,20 +1185,16 @@ void DrawCard(Graphics& g, int visibleIndex) {
     RectF art = RF(ArtRect(visibleIndex));
     GraphicsPath clip;
     RoundPath(clip, art, (REAL)S(6));
-    GraphicsState state = g.Save();
-    g.SetClip(&clip, CombineModeIntersect);
-    if (Bitmap* portrait = GetPortrait(game.appId)) {
-        g.DrawImage(portrait, art);
-    } else if (Bitmap* header = GetCover(game.appId)) {
-        // No portrait art: fill the card with the middle of the wide header.
-        REAL sourceH = (REAL)header->GetHeight(), sourceW = sourceH * art.Width / art.Height;
-        g.DrawImage(header, art, ((REAL)header->GetWidth() - sourceW) / 2, 0, sourceW, sourceH, UnitPixel);
+    Bitmap* portrait = GetPortrait(game.appId);
+    Bitmap* source = portrait ? portrait : GetCover(game.appId);  // without portrait art, use the middle of the header
+    if (source) {
+        Bitmap* baked = GetBaked(g_bakedCards, game.appId, source, g_L.artW, g_L.artH, (REAL)S(6), portrait == nullptr);
+        g.DrawImage(baked, Rect((int)art.X, (int)art.Y, g_L.artW, g_L.artH));
     } else {
         SolidBrush brush(kCover);
         g.FillPath(&brush, &clip);
         DrawCentered(g, game.name.substr(0, 1), (REAL)S(40), true, kAccentHover, art);
     }
-    g.Restore(state);
 
     if (hover || selected) {
         RectF play = RF(PlayRect(visibleIndex));
@@ -1141,8 +1210,11 @@ void DrawCard(Graphics& g, int visibleIndex) {
 
     REAL textTop = art.GetBottom() + S(10);
     DrawLabel(g, game.name, (REAL)S(15), true, selected ? kAccentHover : kText, RectF(art.X, textTop, art.Width, (REAL)S(20)));
-    DrawLabel(g, PlayInfo(game), (REAL)S(13), false, kText2,
-        RectF(art.X, textTop + S(22), art.Width, (REAL)S(34)), StringAlignmentNear, StringAlignmentNear, true);
+    // Play time and last played on their own lines.
+    PlayParts stats = PlayStats(game);
+    DrawLabel(g, stats.playtime, (REAL)S(13), false, kText2, RectF(art.X, textTop + S(22), art.Width, (REAL)S(17)));
+    if (!stats.when.empty())
+        DrawLabel(g, L"Zuletzt " + stats.when, (REAL)S(13), false, kText2, RectF(art.X, textTop + S(39), art.Width, (REAL)S(17)));
 }
 
 // ---------------------------------------------------------------- frame
@@ -1169,7 +1241,8 @@ void DrawChips(Graphics& g) {
 
 void DrawList(Graphics& g, int W) {
     RectF listRect = RF(g_L.list);
-    g.SetClip(listRect);
+    GraphicsState clipState = g.Save();
+    g.SetClip(listRect, CombineModeIntersect);
     if (g_visible.empty()) {
         DrawLabel(g, L"Hier ist noch nichts", (REAL)S(18), true, kText,
             RectF(listRect.X, listRect.Y + S(40), listRect.Width, (REAL)S(26)), StringAlignmentCenter);
@@ -1189,7 +1262,7 @@ void DrawList(Graphics& g, int W) {
             FillRound(g, RectF((REAL)(W - S(8)), thumbY, (REAL)S(4), thumbH), (REAL)S(2), Color(90, 255, 255, 255));
         }
     }
-    g.ResetClip();
+    g.Restore(clipState);
 }
 
 void DrawIcon(Graphics& g, Icon icon, REAL cx, REAL cy, REAL size, const Color& color) {
@@ -1345,21 +1418,31 @@ void Paint(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     int W = rc.right, H = rc.bottom;
     if (W > 0 && H > 0) {
-        HDC mem = CreateCompatibleDC(hdc);
-        HBITMAP bmp = CreateCompatibleBitmap(hdc, W, H);
-        HGDIOBJ old = SelectObject(mem, bmp);
+        // The back buffer lives as long as the window size does, and only the invalid part is drawn and copied.
+        static HDC mem = nullptr;
+        static HBITMAP bmp = nullptr;
+        static int bufferW = 0, bufferH = 0;
+        if (!mem) mem = CreateCompatibleDC(hdc);
+        if (bufferW != W || bufferH != H) {
+            HBITMAP created = CreateCompatibleBitmap(hdc, W, H);
+            SelectObject(mem, created);
+            if (bmp) DeleteObject(bmp);
+            bmp = created;
+            bufferW = W;
+            bufferH = H;
+        }
         {
             Graphics g(mem);
+            const RECT& dirty = ps.rcPaint;
+            g.SetClip(Rect(dirty.left, dirty.top, dirty.right - dirty.left, dirty.bottom - dirty.top));
             g.SetSmoothingMode(SmoothingModeAntiAlias);
             g.SetPixelOffsetMode(PixelOffsetModeHalf);
-            g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            g.SetInterpolationMode(InterpolationModeBilinear);
             g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
             DrawUi(g, W, H);
         }
-        BitBlt(hdc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, old);
-        DeleteObject(bmp);
-        DeleteDC(mem);
+        BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left,
+            ps.rcPaint.bottom - ps.rcPaint.top, mem, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
     }
     EndPaint(hwnd, &ps);
 }
@@ -1404,11 +1487,24 @@ void UpdateHover(HWND hwnd, POINT p) {
         for (int i = 0; i < Menu::ItemCount; ++i)
             if (In(g_menu.items[i], p)) next.menuItem = i;
     }
-    if (next.row != g_hover.row || next.button != g_hover.button || next.chip != g_hover.chip ||
-        next.cover != g_hover.cover || next.menuItem != g_hover.menuItem) {
-        g_hover = next;
-        Redraw(hwnd);
-    }
+    bool changed = next.row != g_hover.row || next.button != g_hover.button || next.chip != g_hover.chip ||
+        next.cover != g_hover.cover || next.menuItem != g_hover.menuItem;
+    if (!changed) return;
+
+    // Repaint only what changed: the cards that lose and gain the highlight, the buttons, the chips.
+    Hover previous = g_hover;
+    g_hover = next;
+    if (g_menu.open || previous.menuItem != next.menuItem) { Redraw(hwnd); return; }
+    auto touch = [&](RECT r, int margin) {
+        InflateRect(&r, margin, margin);
+        InvalidateRect(hwnd, &r, FALSE);
+    };
+    for (int row : { previous.row, next.row })
+        if (row >= 0 && row < (int)g_visible.size()) touch(ItemCell(row), S(6));
+    for (int button : { previous.button, next.button })
+        if (button >= 0) touch(g_L.btn[button], S(2));
+    for (int chip : { previous.chip, next.chip })
+        if (chip >= 0 && chip < (int)g_L.chips.size()) touch(g_L.chips[chip], S(2));
 }
 
 void EnsureVisible(int visibleIndex) {
@@ -1828,6 +1924,7 @@ void OnDestroy() {
     if (g_editBrush) DeleteObject(g_editBrush);
     g_headers.Clear();
     g_portraits.Clear();
+    ClearBaked();
     PostQuitMessage(0);
 }
 
