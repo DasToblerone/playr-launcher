@@ -625,26 +625,25 @@ using namespace Gdiplus;
 // Sizes are in 96-dpi pixels and go through S() before use.
 constexpr float kMargin = 24, kRowHeight = 64, kRowInset = 14, kNumberColumn = 52;
 constexpr float kCoverWidth = 96, kCoverHeight = 45;
-constexpr float kChipTop = 108, kChipHeight = 32, kChipGap = 8, kRenameMinWidth = 130;
+constexpr float kPanelGap = 8, kSidebarWidth = 300, kSideHeader = 56, kSideRow = 64, kSideTile = 48;
+constexpr float kMainHeader = 112;
 constexpr float kMenuWidth = 176, kMenuItemHeight = 38, kMenuPad = 6;
 constexpr float kBarHeight = 76, kControlHeight = 40, kBarMargin = 20, kGap = 8;
-constexpr float kPillWidth = 236, kRandomWidth = 190;
+constexpr float kRandomWidth = 190;
 constexpr float kMinClientWidth = 830, kMinClientHeight = 520;
-constexpr float kStartClientWidth = 850, kStartClientHeight = 640;
+constexpr float kStartClientWidth = 1120, kStartClientHeight = 680;
 
-constexpr int ID_EDIT = 2001;
 constexpr int ID_RENAME_EDIT = 2002;
 constexpr int ID_ACTION = 3000;  // + button index
 constexpr UINT_PTR TIMER_ANIMATION = 1;
 constexpr DWORD WINDOW_STYLE = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
 
-// Wide windows switch from a list to a grid of cards.
-constexpr float kGridMinWidth = 1100, kCardPad = 12, kCardGap = 8, kCardTargetWidth = 200, kCardTextHeight = 58;
+// A main panel at least this wide switches from a list to a grid of cards.
+constexpr float kGridMinWidth = 820, kCardPad = 12, kCardGap = 8, kCardTargetWidth = 200, kCardTextHeight = 58;
 
-constexpr int ID_CREATE_CATEGORY = 3100;
 
 enum { BTN_SCAN, BTN_IMPORT, BTN_RANDOM, BTN_COUNT };
-enum class Icon { None, Refresh, Download };
+enum class Icon { None, Refresh, Download, Plus, Library, Folder };
 const wchar_t* const kButtonLabels[BTN_COUNT] = { L"Neu scannen", L"Kategorien aus Steam", L"Zufällig auswählen" };
 const Icon kButtonIcons[BTN_COUNT] = { Icon::Refresh, Icon::Download, Icon::None };
 const float kButtonWidths[BTN_COUNT - 1] = { 140, 200 };
@@ -669,9 +668,9 @@ const Color kDangerHover(255, 240, 98, 102);
 struct Layout {
     RECT list{};
     RECT bar{};
-    RECT pill{};
     RECT btn[BTN_COUNT]{};
-    std::vector<RECT> chips;
+    RECT sidebar{}, main{}, sideList{}, create{};  // create: "+ Erstellen" in the sidebar header
+    std::vector<RECT> chips;  // one row of the sidebar per category
     int rowH = 0;  // vertical step between rows of items (list rows or card rows)
     int wheelStep = 0;
     bool grid = false;
@@ -682,7 +681,8 @@ struct Hover {
     int row = -1, button = -1, chip = -1;
     bool cover = false;
     int menuItem = -1;
-    bool Any() const { return row >= 0 || button >= 0 || chip >= 0 || menuItem >= 0; }
+    bool sideCreate = false;
+    bool Any() const { return row >= 0 || button >= 0 || chip >= 0 || menuItem >= 0 || sideCreate; }
 };
 
 // Context menu of a category chip, opened with the right mouse button.
@@ -731,13 +731,13 @@ HWND g_renameEdit = nullptr;
 bool g_scanReady = false;
 bool g_tracking = false;
 bool g_fullscreen = false;
-HWND g_edit = nullptr;
 HFONT g_editFont = nullptr;
 HBRUSH g_editBrush = nullptr;
 std::vector<int> g_visible;  // indices into g_games for the current category
 int g_active = 0;            // selected category chip
 int g_sel = -1;              // selected game (index into g_games)
 int g_scroll = 0;
+int g_sideScroll = 0;        // scroll position of the sidebar
 
 int S(float v) { return (int)std::lround(v * g_scale); }
 
@@ -763,6 +763,20 @@ int MaxScroll() {
 
 void ClampScroll() { g_scroll = std::clamp(g_scroll, 0, MaxScroll()); }
 
+int MaxSideScroll() {
+    int content = (int)g_categories.size() * S(kSideRow), view = (int)(g_L.sideList.bottom - g_L.sideList.top);
+    return std::max(0, content - view);
+}
+
+void ClampSideScroll() { g_sideScroll = std::clamp(g_sideScroll, 0, MaxSideScroll()); }
+
+// The field that replaces a category's name while it is renamed.
+RECT RenameRect(int chip) {
+    const RECT& row = g_L.chips[chip];
+    int left = row.left + S(8) + S(kSideTile) + S(12) - S(10), top = row.top + S(8);
+    return { left, top, row.right - S(6), top + S(28) };
+}
+
 void Redraw(HWND hwnd) { InvalidateRect(hwnd, nullptr, FALSE); }
 
 void LayoutToast(HWND hwnd);
@@ -785,14 +799,27 @@ void Relayout(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     int W = rc.right, H = rc.bottom;
 
+    // Two rounded panels on a black window, like Spotify: the library on the left, the games on the right.
+    int gap = S(kPanelGap), panelBottom = H - S(kBarHeight);
+    g_L.bar = { 0, panelBottom, W, H };
+    g_L.sidebar = { gap, gap, gap + S(kSidebarWidth), std::max(gap + S(100), panelBottom - S(4)) };
+    g_L.main = { g_L.sidebar.right + gap, gap, W - gap, g_L.sidebar.bottom };
+    g_L.sideList = { g_L.sidebar.left, g_L.sidebar.top + S(kSideHeader), g_L.sidebar.right, g_L.sidebar.bottom - S(8) };
+    int createW = S(104), createH = S(34);
+    g_L.create = { g_L.sidebar.right - S(12) - createW, g_L.sidebar.top + (S(kSideHeader) - createH) / 2,
+        g_L.sidebar.right - S(12), g_L.sidebar.top + (S(kSideHeader) - createH) / 2 + createH };
+    int listTop = g_L.main.top + S(kMainHeader);
+    g_L.list = { g_L.main.left, listTop, g_L.main.right, std::max(listTop, (int)g_L.main.bottom - S(8)) };
+
+    int mainWidth = g_L.main.right - g_L.main.left;
     g_L.rowH = S(kRowHeight);
     g_L.cols = 1;
-    g_L.grid = W >= S(kGridMinWidth);
+    g_L.grid = mainWidth >= S(kGridMinWidth);
     if (g_L.grid) {
-        // Portrait art in a grid; the cells stretch so the columns fill the window.
+        // Portrait art in a grid; the cells stretch so the columns fill the panel.
         g_L.cardPad = S(kCardPad);
         g_L.cardGap = S(kCardGap);
-        int available = W - 2 * (S(kMargin) - g_L.cardPad);
+        int available = mainWidth - 2 * (S(kMargin) - g_L.cardPad);
         g_L.cols = std::max(1, (available + g_L.cardGap) / (S(kCardTargetWidth) + g_L.cardGap));
         g_L.cellW = (available - g_L.cardGap * (g_L.cols - 1)) / g_L.cols;
         g_L.artW = g_L.cellW - 2 * g_L.cardPad;
@@ -801,47 +828,31 @@ void Relayout(HWND hwnd) {
         g_L.rowH = g_L.cellH + g_L.cardGap;
     }
     g_L.wheelStep = g_L.grid ? g_L.rowH / 3 : g_L.rowH;
+    // The categories are rows of the sidebar, which scrolls on its own when there are many.
+    ClampSideScroll();
     g_L.chips.clear();
-    {
-        Graphics g(hwnd);
-        FontFamily family(L"Arial");
-        Font font(&family, (REAL)S(13), FontStyleBold, UnitPixel);
-        int x = S(kMargin), y = S(kChipTop), h = S(kChipHeight), gap = S(kChipGap);
-        for (int i = 0; i < (int)g_categories.size(); ++i) {
-            RectF box;
-            g.MeasureString(g_categories[i].c_str(), -1, &font, PointF(0, 0), &box);
-            int w = (int)box.Width + S(28);
-            if (i == g_renameChip) w = std::max(w, S(kRenameMinWidth));
-            if (x + w > W - S(kMargin) && x > S(kMargin)) { x = S(kMargin); y += h + gap; }
-            g_L.chips.push_back({ x, y, x + w, y + h });
-            x += w + gap;
-        }
-        int listTop = y + h + S(16);
-        g_L.bar = { 0, H - S(kBarHeight), W, H };
-        g_L.list = { 0, listTop, W, std::max(listTop, (int)g_L.bar.top) };
+    for (int i = 0; i < (int)g_categories.size(); ++i) {
+        int top = g_L.sideList.top + i * S(kSideRow) - g_sideScroll;
+        g_L.chips.push_back({ g_L.sidebar.left + S(8), top, g_L.sidebar.right - S(8), top + S(kSideRow) });
     }
 
     int ph = S(kControlHeight);
     int py = g_L.bar.top + (S(kBarHeight) - ph) / 2;
-    g_L.pill = { S(kBarMargin), py, S(kBarMargin) + S(kPillWidth), py + ph };
-    int x = g_L.pill.right + S(kGap);
+    int x = S(kBarMargin);
     for (int i = 0; i < BTN_RANDOM; ++i) {
         g_L.btn[i] = { x, py, x + S(kButtonWidths[i]), py + ph };
         x += S(kButtonWidths[i]) + S(kGap);
     }
     g_L.btn[BTN_RANDOM] = { W - S(kBarMargin) - S(kRandomWidth), py, W - S(kBarMargin), py + ph };
 
-    if (g_edit) {
-        int eh = S(18), left = g_L.pill.left + S(20);
-        SetWindowPos(g_edit, nullptr, left, py + (ph - eh) / 2, g_L.pill.right - S(20) - left, eh, SWP_NOZORDER);
-    }
     if (g_renameEdit && g_renameChip >= 0 && g_renameChip < (int)g_L.chips.size()) {
-        const RECT& c = g_L.chips[g_renameChip];
+        RECT field = RenameRect(g_renameChip);
         int eh = S(18);
-        SetWindowPos(g_renameEdit, HWND_TOP, c.left + S(14), c.top + (c.bottom - c.top - eh) / 2,
-            c.right - c.left - S(28), eh, SWP_SHOWWINDOW);
+        SetWindowPos(g_renameEdit, HWND_TOP, field.left + S(10), field.top + (field.bottom - field.top - eh) / 2,
+            field.right - field.left - S(20), eh, SWP_SHOWWINDOW);
     }
     ClampScroll();
+    ClampSideScroll();
     if (g_toast.active) LayoutToast(hwnd);
     Redraw(hwnd);
 }
@@ -891,10 +902,10 @@ struct BakedArt {
     Bitmap* bitmap = nullptr;
 };
 using BakedCache = std::map<unsigned long long, BakedArt>;
-BakedCache g_bakedRows, g_bakedCards;
+BakedCache g_bakedRows, g_bakedCards, g_bakedTilesSmall, g_bakedTilesFull;
 
 void ForgetBaked(unsigned long long id) {
-    for (BakedCache* cache : { &g_bakedRows, &g_bakedCards }) {
+    for (BakedCache* cache : { &g_bakedRows, &g_bakedCards, &g_bakedTilesSmall, &g_bakedTilesFull }) {
         auto it = cache->find(id);
         if (it == cache->end()) continue;
         delete it->second.bitmap;
@@ -903,7 +914,7 @@ void ForgetBaked(unsigned long long id) {
 }
 
 void ClearBaked() {
-    for (BakedCache* cache : { &g_bakedRows, &g_bakedCards }) {
+    for (BakedCache* cache : { &g_bakedRows, &g_bakedCards, &g_bakedTilesSmall, &g_bakedTilesFull }) {
         for (auto& entry : *cache) delete entry.second.bitmap;
         cache->clear();
     }
@@ -939,14 +950,18 @@ void FillRound(Graphics& g, RectF r, REAL radius, const Color& color) {
     g.FillPath(&brush, &path);
 }
 
-// Strokes a pill-shaped outline inside `r` so the line stays within the rectangle.
-void StrokePill(Graphics& g, RectF r, const Color& color, REAL width, bool dashed = false) {
+// Strokes a rounded outline inside `r` so the line stays within the rectangle.
+void StrokeRound(Graphics& g, RectF r, REAL radius, const Color& color, REAL width, bool dashed = false) {
     GraphicsPath path;
     REAL inset = width / 2;
-    RoundPath(path, RectF(r.X + inset, r.Y + inset, r.Width - 2 * inset, r.Height - 2 * inset), r.Height / 2 - inset);
+    RoundPath(path, RectF(r.X + inset, r.Y + inset, r.Width - 2 * inset, r.Height - 2 * inset), radius - inset);
     Pen pen(color, width);
     if (dashed) pen.SetDashStyle(DashStyleDash);
     g.DrawPath(&pen, &path);
+}
+
+void StrokePill(Graphics& g, RectF r, const Color& color, REAL width, bool dashed = false) {
+    StrokeRound(g, r, r.Height / 2, color, width, dashed);
 }
 
 // Creating fonts is slow, and a repaint draws dozens of labels, so they are created once per size.
@@ -1052,8 +1067,8 @@ int ItemTop(int i) { return g_L.list.top + (i / g_L.cols) * g_L.rowH - g_scroll;
 
 RECT ItemCell(int i) {
     int top = ItemTop(i);
-    if (!g_L.grid) return { 0, top, (int)g_L.list.right, top + g_L.rowH };
-    int left = S(kMargin) - g_L.cardPad + (i % g_L.cols) * (g_L.cellW + g_L.cardGap);
+    if (!g_L.grid) return { (int)g_L.list.left, top, (int)g_L.list.right, top + g_L.rowH };
+    int left = g_L.list.left + S(kMargin) - g_L.cardPad + (i % g_L.cols) * (g_L.cellW + g_L.cardGap);
     return { left, top, left + g_L.cellW, top + g_L.cellH };
 }
 
@@ -1063,7 +1078,7 @@ RECT ArtRect(int i) {
         int left = cell.left + g_L.cardPad, top = cell.top + g_L.cardPad;
         return { left, top, left + g_L.artW, top + g_L.artH };
     }
-    int left = S(kRowInset) + S(kNumberColumn);
+    int left = cell.left + S(kRowInset) + S(kNumberColumn);
     int top = cell.top + S(2) + (g_L.rowH - S(4) - S(kCoverHeight)) / 2;
     return { left, top, left + S(kCoverWidth), top + S(kCoverHeight) };
 }
@@ -1138,7 +1153,9 @@ void DrawRow(Graphics& g, int visibleIndex, int W) {
     bool selected = g_visible[visibleIndex] == g_sel;
     bool hover = visibleIndex == g_hover.row;
 
-    RectF slot((REAL)S(kRowInset), (REAL)rowTop + S(2), (REAL)(W - 2 * S(kRowInset)), (REAL)(g_L.rowH - S(4)));
+    RECT cellRect = ItemCell(visibleIndex);
+    RectF slot((REAL)cellRect.left + S(kRowInset), (REAL)rowTop + S(2),
+        (REAL)(cellRect.right - cellRect.left - 2 * S(kRowInset)), (REAL)(g_L.rowH - S(4)));
     if (selected) FillRound(g, slot, (REAL)S(8), kSurface);
     else if (hover) FillRound(g, slot, (REAL)S(8), kSurfaceHover);
 
@@ -1219,26 +1236,6 @@ void DrawCard(Graphics& g, int visibleIndex) {
 
 // ---------------------------------------------------------------- frame
 
-void DrawChips(Graphics& g) {
-    for (int i = 0; i < (int)g_L.chips.size(); ++i) {
-        RectF r = RF(g_L.chips[i]);
-        bool dragging = g_drag.active;
-        bool target = dragging && i >= 1 && i == g_drag.dropChip;
-        bool active = !dragging && i == g_active;
-        bool hovered = !dragging && i == g_hover.chip;
-        if (i == g_renameChip) {  // the edit control sits on top of this chip
-            FillRound(g, r, r.Height / 2, kField);
-            StrokePill(g, r, kText, 2.0f);
-            continue;
-        }
-        Color fill = target || active ? kAccent : (hovered ? kChipHover : kSurface);
-        FillRound(g, r, r.Height / 2, fill);
-        if (dragging && i >= 1 && !target) StrokePill(g, r, kAccent, 1.5f, true);
-        Color text = target || active ? kOnAccent : (dragging && i == 0 ? kOutline : kText);
-        DrawCentered(g, g_categories[i], (REAL)S(13), true, text, r);
-    }
-}
-
 void DrawList(Graphics& g, int W) {
     RectF listRect = RF(g_L.list);
     GraphicsState clipState = g.Save();
@@ -1259,7 +1256,7 @@ void DrawList(Graphics& g, int W) {
             REAL view = listRect.Height, content = (REAL)ContentHeight();
             REAL thumbH = std::max((REAL)S(32), view * view / content);
             REAL thumbY = listRect.Y + (view - thumbH) * g_scroll / maxScroll;
-            FillRound(g, RectF((REAL)(W - S(8)), thumbY, (REAL)S(4), thumbH), (REAL)S(2), Color(90, 255, 255, 255));
+            FillRound(g, RectF((REAL)(g_L.list.right - S(8)), thumbY, (REAL)S(4), thumbH), (REAL)S(2), Color(90, 255, 255, 255));
         }
     }
     g.Restore(clipState);
@@ -1284,6 +1281,22 @@ void DrawIcon(Graphics& g, Icon icon, REAL cx, REAL cy, REAL size, const Color& 
             PointF(end.X - tangent.X * s * 0.5f - normal.X * s * 0.8f, end.Y - tangent.Y * s * 0.5f - normal.Y * s * 0.8f) };
         SolidBrush brush(color);
         g.FillPolygon(&brush, head, 3);
+        break;
+    }
+    case Icon::Plus:
+        g.DrawLine(&pen, cx - h * 0.7f, cy, cx + h * 0.7f, cy);
+        g.DrawLine(&pen, cx, cy - h * 0.7f, cx, cy + h * 0.7f);
+        break;
+    case Icon::Library:  // three bars, the last one leaning, like Spotify's library icon
+        g.DrawLine(&pen, cx - h * 0.7f, cy - h * 0.75f, cx - h * 0.7f, cy + h * 0.75f);
+        g.DrawLine(&pen, cx - h * 0.1f, cy - h * 0.75f, cx - h * 0.1f, cy + h * 0.75f);
+        g.DrawLine(&pen, cx + h * 0.45f, cy - h * 0.7f, cx + h * 0.85f, cy + h * 0.75f);
+        break;
+    case Icon::Folder: {
+        PointF outline[6] = { PointF(cx - h * 0.85f, cy + h * 0.6f), PointF(cx - h * 0.85f, cy - h * 0.6f),
+            PointF(cx - h * 0.2f, cy - h * 0.6f), PointF(cx + h * 0.05f, cy - h * 0.3f),
+            PointF(cx + h * 0.85f, cy - h * 0.3f), PointF(cx + h * 0.85f, cy + h * 0.6f) };
+        g.DrawPolygon(&pen, outline, 6);
         break;
     }
     case Icon::Download: {
@@ -1314,19 +1327,97 @@ void DrawButtonContent(Graphics& g, RectF r, Icon icon, const std::wstring& text
         RectF(startX + iconW + gap, r.Y, textW + S(12), r.Height), StringAlignmentNear, StringAlignmentCenter);
 }
 
-// Category field in the style of Spotify's search box: dark pill, icon, white ring on focus.
-void DrawCategoryField(Graphics& g) {
-    RectF pill = RF(g_L.pill);
-    bool focus = GetFocus() == g_edit;
-    FillRound(g, pill, pill.Height / 2, kField);
-    if (focus) StrokePill(g, pill, kText, 2.0f);
+// The tile of a category: its first games as a mosaic, like a playlist cover.
+void DrawCategoryTile(Graphics& g, int category, RectF tile) {
+    GraphicsPath shape;
+    RoundPath(shape, tile, (REAL)S(6));
+    GraphicsState state = g.Save();
+    g.SetClip(&shape, CombineModeIntersect);
+
+    std::vector<const Game*> games;
+    for (const auto& game : g_games) {
+        if (category == 0 || game.category == g_categories[category]) games.push_back(&game);
+        if (games.size() == 4) break;
+    }
+    REAL cx = tile.X + tile.Width / 2, cy = tile.Y + tile.Height / 2;
+    if (category == 0) {
+        SolidBrush brush(kAccent);
+        g.FillRectangle(&brush, tile);
+        DrawIcon(g, Icon::Library, cx, cy, (REAL)S(22), kOnAccent);
+    } else if (games.empty()) {
+        SolidBrush brush(kSurface);
+        g.FillRectangle(&brush, tile);
+        DrawIcon(g, Icon::Folder, cx, cy, (REAL)S(24), kText2);
+    } else {
+        int cells = games.size() == 1 ? 1 : 2;
+        REAL cell = tile.Width / cells;
+        SolidBrush empty(kCover);
+        g.FillRectangle(&empty, tile);
+        for (int i = 0; i < (int)games.size() && i < cells * cells; ++i) {
+            Bitmap* header = GetCover(games[i]->appId);
+            if (!header) continue;
+            BakedCache& cache = cells == 1 ? g_bakedTilesFull : g_bakedTilesSmall;
+            int size = (int)cell;
+            Bitmap* baked = GetBaked(cache, games[i]->appId, header, size, size, 1.0f, true);
+            g.DrawImage(baked, Rect((int)(tile.X + (i % cells) * cell), (int)(tile.Y + (i / cells) * cell), size, size));
+        }
+    }
+    g.Restore(state);
+}
+
+// The library: "Alle Spiele" and the categories as rows, like playlists in Spotify's sidebar.
+void DrawSidebar(Graphics& g) {
+    RectF panel = RF(g_L.sidebar);
+    FillRound(g, panel, (REAL)S(8), kBg);
+    DrawLabel(g, L"Bibliothek", (REAL)S(17), true, kText,
+        RectF(panel.X + S(20), panel.Y, (REAL)S(140), (REAL)S(kSideHeader)), StringAlignmentNear, StringAlignmentCenter);
+    RectF create = RF(g_L.create);
+    FillRound(g, create, create.Height / 2, g_hover.sideCreate ? kChipHover : kSurface);
+    DrawButtonContent(g, create, Icon::Plus, L"Erstellen", kText);
+
+    GraphicsState state = g.Save();
+    g.SetClip(RF(g_L.sideList), CombineModeIntersect);
+    for (int i = 0; i < (int)g_L.chips.size(); ++i) {
+        if (g_L.chips[i].bottom < g_L.sideList.top || g_L.chips[i].top > g_L.sideList.bottom) continue;
+        RectF r = RF(g_L.chips[i]);
+        bool dragging = g_drag.active;
+        bool target = dragging && i >= 1 && i == g_drag.dropChip;
+        bool active = i == g_active;
+        bool hovered = !dragging && i == g_hover.chip;
+
+        if (target) {
+            FillRound(g, r, (REAL)S(8), Color(60, 168, 85, 247));
+            StrokeRound(g, r, (REAL)S(8), kAccent, 2.0f);
+        } else if (dragging && i >= 1) {
+            StrokeRound(g, r, (REAL)S(8), kAccent, 1.5f, true);
+        } else if (active || hovered) {
+            FillRound(g, r, (REAL)S(8), kSurfaceHover);
+        }
+
+        REAL tileSize = (REAL)S(kSideTile);
+        RectF tile(r.X + S(8), r.Y + (r.Height - tileSize) / 2, tileSize, tileSize);
+        DrawCategoryTile(g, i, tile);
+
+        REAL tx = tile.GetRight() + S(12), tw = r.GetRight() - tx - S(8);
+        if (i == g_renameChip) {  // the edit control sits on top of the name
+            RectF field = RF(RenameRect(i));
+            FillRound(g, field, (REAL)S(6), kField);
+            StrokeRound(g, field, (REAL)S(6), kText, 2.0f);
+        } else {
+            Color name = active && !dragging ? kAccentHover : (dragging && i == 0 ? kOutline : kText);
+            DrawLabel(g, g_categories[i], (REAL)S(15), true, name, RectF(tx, r.Y + S(12), tw, (REAL)S(22)));
+        }
+        int count = i == 0 ? (int)g_games.size()
+            : (int)std::count_if(g_games.begin(), g_games.end(), [&](const Game& game) { return game.category == g_categories[i]; });
+        DrawLabel(g, std::to_wstring(count) + (count == 1 ? L" Spiel" : L" Spiele"), (REAL)S(13), false, kText2,
+            RectF(tx, r.Y + S(36), tw, (REAL)S(18)));
+    }
+    g.Restore(state);
 }
 
 void DrawBar(Graphics& g, int W, int H) {
-    SolidBrush bar(kBar), line(kLine);
+    SolidBrush bar(kBar);
     g.FillRectangle(&bar, 0, (INT)g_L.bar.top, W, H - (INT)g_L.bar.top);
-    g.FillRectangle(&line, 0, (INT)g_L.bar.top, W, 1);
-    DrawCategoryField(g);
 
     for (int i = 0; i < BTN_COUNT; ++i) {
         RectF r = RF(g_L.btn[i]);
@@ -1389,21 +1480,21 @@ void DrawToast(Graphics& g) {
 }
 
 void DrawUi(Graphics& g, int W, int H) {
-    SolidBrush bg(kBg);
-    g.FillRectangle(&bg, 0, 0, W, H);
+    SolidBrush window(kBar);
+    g.FillRectangle(&window, 0, 0, W, H);
+    FillRound(g, RF(g_L.main), (REAL)S(8), kBg);
 
-    RectF header((REAL)S(kMargin), 0, (REAL)(W - 2 * S(kMargin)), 0);
+    RectF header((REAL)(g_L.main.left + S(kMargin)), (REAL)g_L.main.top, (REAL)(g_L.main.right - g_L.main.left - 2 * S(kMargin)), 0);
     DrawLabel(g, g_steamName.empty() ? L"Deine Steam-Bibliothek" : L"Bibliothek von " + g_steamName, (REAL)S(13), true, kText2,
-        RectF(header.X, (REAL)S(16), header.Width, (REAL)S(18)));
+        RectF(header.X, header.Y + S(16), header.Width, (REAL)S(18)));
     DrawLabel(g, std::to_wstring(g_games.size()) + (g_games.size() == 1 ? L" Spiel" : L" Spiele"), (REAL)S(38), true, kText,
-        RectF(header.X, (REAL)S(32), header.Width, (REAL)S(48)));
+        RectF(header.X, header.Y + S(32), header.Width, (REAL)S(48)));
     std::wstring hint = L"Zieh ein Spiel auf eine Kategorie, um es zuzuordnen";
     if (g_drag.active) hint = L"Lass das Spiel auf einer Kategorie los, um es zuzuordnen";
-    else if (g_categories.size() <= 1) hint = L"Lege unten eine Kategorie an und zieh Spiele hinein";
-    DrawLabel(g, hint, (REAL)S(13), false, kText2,
-        RectF((REAL)S(kMargin), (REAL)S(82), (REAL)(W - 2 * S(kMargin)), (REAL)S(20)));
+    else if (g_categories.size() <= 1) hint = L"Lege links eine Kategorie an und zieh Spiele hinein";
+    DrawLabel(g, hint, (REAL)S(13), false, kText2, RectF(header.X, header.Y + S(82), header.Width, (REAL)S(20)));
 
-    DrawChips(g);
+    DrawSidebar(g);
     DrawList(g, W);
     DrawBar(g, W, H);
     DrawToast(g);
@@ -1453,7 +1544,7 @@ int HitRow(POINT p) {
     if (!In(g_L.list, p)) return -1;
     int row = (p.y - g_L.list.top + g_scroll) / g_L.rowH, col = 0;
     if (g_L.grid) {
-        int x = p.x - (S(kMargin) - g_L.cardPad);
+        int x = p.x - (g_L.list.left + S(kMargin) - g_L.cardPad);
         if (x < 0) return -1;
         col = x / (g_L.cellW + g_L.cardGap);
         if (col >= g_L.cols) return -1;
@@ -1470,6 +1561,7 @@ int HitButton(POINT p) {
 }
 
 int HitChip(POINT p) {
+    if (!In(g_L.sideList, p)) return -1;  // rows scrolled out of the sidebar are not clickable
     for (int i = 0; i < (int)g_L.chips.size(); ++i)
         if (In(g_L.chips[i], p)) return i;
     return -1;
@@ -1481,6 +1573,7 @@ void UpdateHover(HWND hwnd, POINT p) {
     next.button = HitButton(p);
     next.chip = HitChip(p);
     next.cover = InPlayZone(next.row, p);
+    next.sideCreate = In(g_L.create, p);
     if (g_menu.open) {
         // The menu sits on top, so it hides whatever is underneath.
         next = Hover{};
@@ -1488,7 +1581,7 @@ void UpdateHover(HWND hwnd, POINT p) {
             if (In(g_menu.items[i], p)) next.menuItem = i;
     }
     bool changed = next.row != g_hover.row || next.button != g_hover.button || next.chip != g_hover.chip ||
-        next.cover != g_hover.cover || next.menuItem != g_hover.menuItem;
+        next.cover != g_hover.cover || next.menuItem != g_hover.menuItem || next.sideCreate != g_hover.sideCreate;
     if (!changed) return;
 
     // Repaint only what changed: the cards that lose and gain the highlight, the buttons, the chips.
@@ -1505,6 +1598,7 @@ void UpdateHover(HWND hwnd, POINT p) {
         if (button >= 0) touch(g_L.btn[button], S(2));
     for (int chip : { previous.chip, next.chip })
         if (chip >= 0 && chip < (int)g_L.chips.size()) touch(g_L.chips[chip], S(2));
+    if (previous.sideCreate != next.sideCreate) touch(g_L.create, S(2));
 }
 
 void EnsureVisible(int visibleIndex) {
@@ -1604,27 +1698,19 @@ void CommitRename(HWND hwnd) {
     EndRename(hwnd, true);
 }
 
-void AddCategory(HWND hwnd) {
-    int length = GetWindowTextLengthW(g_edit);
-    if (length <= 0) return;
-    std::wstring name(length + 1, L'\0');
-    GetWindowTextW(g_edit, name.data(), length + 1);
-    name.resize(length);
-    if (name.find_first_of(L"\t\r\n") != std::wstring::npos) {
-        ShowToast(hwnd, L"Der Name darf keine Tabs oder Zeilenumbrüche enthalten");
-        return;
-    }
-    if (IsReservedCategory(name) || std::find(g_categories.begin(), g_categories.end(), name) != g_categories.end()) {
-        ShowToast(hwnd, L"Diese Kategorie gibt es schon");
-        return;
-    }
+// "+ Erstellen" in the sidebar: adds a category with a default name and lets you type the real one right away.
+void CreateCategoryRow(HWND hwnd) {
+    std::wstring name = L"Neue Kategorie";
+    for (int number = 2; std::find(g_categories.begin(), g_categories.end(), name) != g_categories.end(); ++number)
+        name = L"Neue Kategorie " + std::to_wstring(number);
     g_categories.push_back(name);
-    SetWindowTextW(g_edit, L"");
     g_active = (int)g_categories.size() - 1;
     g_scroll = 0;
+    g_sideScroll = MaxSideScroll() + S(kSideRow);
     RefreshGames();
     Relayout(hwnd);
     SaveSettings();
+    StartRename(hwnd, g_active);
 }
 
 void DeleteCategory(HWND hwnd, int index) {
@@ -1801,18 +1887,6 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
-LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
-    if (msg == WM_KEYDOWN && wp == VK_F11) { ToggleFullscreen(GetParent(hwnd)); return 0; }
-    if (msg == WM_CHAR) {
-        if (wp == VK_RETURN) {
-            SendMessageW(GetParent(hwnd), WM_COMMAND, MAKEWPARAM(ID_CREATE_CATEGORY, BN_CLICKED), 0);
-            return 0;
-        }
-        if (wp == VK_ESCAPE) { SetFocus(GetParent(hwnd)); return 0; }
-    }
-    return DefSubclassProc(hwnd, msg, wp, lp);
-}
-
 POINT ClientPoint(LPARAM lp) { return { (short)LOWORD(lp), (short)HIWORD(lp) }; }
 
 void OnMouseDown(HWND hwnd, UINT msg, LPARAM lp) {
@@ -1826,8 +1900,8 @@ void OnMouseDown(HWND hwnd, UINT msg, LPARAM lp) {
         else if (picked == Menu::Delete) DeleteCategory(hwnd, target);
         return;
     }
-    if (In(g_L.pill, p)) {
-        SetFocus(g_edit);  // the whole field is clickable; Enter creates the category
+    if (In(g_L.create, p)) {
+        CreateCategoryRow(hwnd);
         return;
     }
     int chip = HitChip(p), button = HitButton(p), row = HitRow(p);
@@ -1905,12 +1979,6 @@ void OnCreate(HWND hwnd) {
     g_editFont = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
     g_editBrush = CreateSolidBrush(RGB(31, 31, 31));
-    g_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-        0, 0, 100, 20, hwnd, (HMENU)(INT_PTR)ID_EDIT, GetModuleHandleW(nullptr), nullptr);
-    SendMessageW(g_edit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
-    SendMessageW(g_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Neue Kategorie");  // stays visible while focused, like a search box
-    SetWindowSubclass(g_edit, EditProc, 1, 0);
-
     g_renameEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
         0, 0, 100, 20, hwnd, (HMENU)(INT_PTR)ID_RENAME_EDIT, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(g_renameEdit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
@@ -1935,7 +2003,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_SIZE:
-        if (g_edit) Relayout(hwnd);
+        if (g_renameEdit) Relayout(hwnd);
         return 0;
 
     case WM_GETMINMAXINFO: {
@@ -1976,11 +2044,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_MOUSEWHEEL: {
         CloseMenu(hwnd);
-        g_scroll -= GET_WHEEL_DELTA_WPARAM(wp) * g_L.wheelStep / WHEEL_DELTA;
-        ClampScroll();
         POINT p;
         GetCursorPos(&p);
         ScreenToClient(hwnd, &p);
+        int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        if (In(g_L.sidebar, p)) {
+            g_sideScroll -= delta * S(kSideRow) / WHEEL_DELTA;
+            Relayout(hwnd);  // moves the rows
+        } else {
+            g_scroll -= delta * g_L.wheelStep / WHEEL_DELTA;
+            ClampScroll();
+        }
         UpdateHover(hwnd, p);
         Redraw(hwnd);
         return 0;
@@ -2013,15 +2087,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_COMMAND: {
         int id = LOWORD(wp);
-        if (id == ID_CREATE_CATEGORY) {
-            AddCategory(hwnd);
-            return 0;
-        }
-        if (id == ID_EDIT) {
-            WORD code = HIWORD(wp);
-            if (code == EN_SETFOCUS || code == EN_KILLFOCUS || code == EN_CHANGE) InvalidateRect(hwnd, &g_L.pill, FALSE);
-            return 0;
-        }
         if (id == ID_RENAME_EDIT) {
             if (HIWORD(wp) == EN_KILLFOCUS) EndRename(hwnd, false);  // clicking away cancels
             return 0;
