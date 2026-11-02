@@ -22,6 +22,7 @@ using std::max;
 
 #include <atomic>
 #include <cmath>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -52,6 +53,8 @@ struct Game {
     std::wstring appId;
     std::wstring name;
     std::wstring category = L"Unsortiert";
+    int playtimeMinutes = 0;
+    long long lastPlayed = 0;  // unix time, 0 when never played
 };
 
 const std::wstring kAllGames = L"Alle Spiele";
@@ -63,10 +66,12 @@ std::map<std::wstring, bool> g_isGame;   // appId -> verdict from the Steam stor
 
 std::wstring g_dataDir;
 std::wstring g_coverDir;
+std::wstring g_steamName;  // persona name of the Steam account that signed in last
 
 fs::path SettingsPath() { return fs::path(g_dataDir) / L"settings.txt"; }
 fs::path TypesPath() { return fs::path(g_dataDir) / L"types.txt"; }
 fs::path CoverPath(const std::wstring& appId) { return fs::path(g_coverDir) / (appId + L".jpg"); }
+fs::path PortraitPath(const std::wstring& appId) { return fs::path(g_coverDir) / (appId + L"_p.jpg"); }
 
 bool IsReservedCategory(const std::wstring& name) { return name == kAllGames || name == kUnsorted; }
 
@@ -353,6 +358,49 @@ void LoadTypes() {
     });
 }
 
+std::wstring SteamPersonaName() {
+    std::wstring text = ReadTextFile(fs::path(SteamPath()) / L"config" / L"loginusers.vdf");
+    // Several accounts can be listed; prefer the one marked as the most recent.
+    for (size_t pos = 0; (pos = text.find(L"\"MostRecent\"", pos)) != std::wstring::npos; pos += 12) {
+        if (VdfValue(text, L"MostRecent", pos) != L"1") continue;
+        size_t name = text.rfind(L"\"PersonaName\"", pos);
+        if (name != std::wstring::npos) return VdfValue(text, L"PersonaName", name);
+    }
+    return VdfValue(text, L"PersonaName");
+}
+
+// Position of the brace that closes the block opened at `open`.
+size_t BlockEnd(const std::wstring& text, size_t open) {
+    int depth = 0;
+    for (size_t i = open; i < text.size(); ++i) {
+        if (text[i] == L'{') ++depth;
+        else if (text[i] == L'}' && --depth == 0) return i;
+    }
+    return text.size();
+}
+
+// Reads play time (minutes) and last played (unix time) per app from Steam's localconfig.vdf.
+void ApplyPlayStats() {
+    std::error_code ec;
+    for (fs::directory_iterator it(fs::path(SteamPath()) / L"userdata", ec), end; !ec && it != end; it.increment(ec)) {
+        std::wstring text = ReadTextFile(it->path() / L"config" / L"localconfig.vdf");
+        if (text.empty()) continue;
+        for (auto& game : g_games) {
+            const std::wstring marker = L"\"" + game.appId + L"\"";
+            for (size_t pos = 0; (pos = text.find(marker, pos)) != std::wstring::npos; pos += marker.size()) {
+                size_t open = text.find_first_not_of(L" \t\r\n", pos + marker.size());
+                if (open == std::wstring::npos || text[open] != L'{') continue;
+                std::wstring block = text.substr(open, BlockEnd(text, open) - open);
+                std::wstring played = VdfValue(block, L"LastPlayed"), minutes = VdfValue(block, L"Playtime");
+                if (played.empty() && minutes.empty()) continue;
+                game.lastPlayed = std::max(game.lastPlayed, _wtoi64(played.c_str()));
+                game.playtimeMinutes = std::max(game.playtimeMinutes, _wtoi(minutes.c_str()));
+                break;
+            }
+        }
+    }
+}
+
 // Replaces the game list with `detected`, keeping saved category assignments and dropping known non-games.
 void MergeGames(const std::map<std::wstring, Game>& detected) {
     std::map<std::wstring, std::wstring> assignments;
@@ -373,6 +421,7 @@ void MergeGames(const std::map<std::wstring, Game>& detected) {
     std::sort(g_games.begin(), g_games.end(), [](const Game& a, const Game& b) {
         return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
     });
+    ApplyPlayStats();
     SaveSettings();
 }
 
@@ -469,46 +518,63 @@ private:
     std::atomic<bool> running_{ false };
 };
 
-constexpr UINT WM_COVER = WM_APP + 1;       // wParam: appId whose cover finished downloading
+constexpr UINT WM_COVER = WM_APP + 1;       // wParam: appId whose art finished downloading (+ kPortraitFlag)
+constexpr unsigned long long kPortraitFlag = 1ull << 62;
 constexpr UINT WM_SCANDONE = WM_APP + 2;    // lParam: heap-allocated std::map<std::wstring, Game>
 constexpr UINT WM_CLASSIFIED = WM_APP + 3;  // wParam: appId, lParam: 1 when it is a game
 
 HWND g_mainWnd = nullptr;
 
-// Downloads the header image. Newer apps keep art under a hashed path, so the store API is the fallback.
-void DownloadCover(const std::wstring& appId) {
-    fs::path finalPath = CoverPath(appId);
+// Downloads `urls` in order into `finalPath` through a temp file; the first one that works wins.
+bool FetchArt(const std::vector<std::wstring>& urls, const fs::path& finalPath) {
     std::error_code ec;
-    if (fs::exists(finalPath, ec)) return;
-
     fs::path tmp = finalPath;
     tmp += L".tmp";
-    bool got = HttpGetToFile(L"https://cdn.cloudflare.steamstatic.com/steam/apps/" + appId + L"/header.jpg", tmp);
-    if (!got) {
-        std::string json = StoreDetails(appId, L"basic");
-        const std::string key = "\"header_image\":\"";
-        size_t start = json.find(key);
-        if (start != std::string::npos) {
-            std::string url;
-            for (size_t i = start + key.size(); i < json.size() && json[i] != '"'; ++i) {
-                if (json[i] != '\\' || i + 1 >= json.size()) { url += json[i]; continue; }
-                if (json.compare(i + 1, 5, "u0026") == 0) { url += '&'; i += 5; }
-                else url += json[++i];
-            }
-            got = HttpGetToFile(std::wstring(url.begin(), url.end()), tmp);
-        }
-    }
-    if (!got) { fs::remove(tmp, ec); return; }
+    bool got = false;
+    for (const auto& url : urls)
+        if ((got = HttpGetToFile(url, tmp))) break;
+    if (!got) { fs::remove(tmp, ec); return false; }
 
     // Virus scanners can briefly lock a freshly written file, so retry the rename.
     for (int attempt = 0; attempt < 10; ++attempt) {
-        if (MoveFileExW(tmp.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
-            PostMessageW(g_mainWnd, WM_COVER, (WPARAM)wcstoull(appId.c_str(), nullptr, 10), 0);
-            return;
-        }
+        if (MoveFileExW(tmp.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) return true;
         Sleep(150);
     }
     fs::remove(tmp, ec);
+    return false;
+}
+
+// Newer apps keep their header under a hashed path, so the store API is the fallback.
+std::wstring StoreHeaderUrl(const std::wstring& appId) {
+    std::string json = StoreDetails(appId, L"basic");
+    const std::string key = "\"header_image\":\"";
+    size_t start = json.find(key);
+    if (start == std::string::npos) return {};
+    std::string url;
+    for (size_t i = start + key.size(); i < json.size() && json[i] != '"'; ++i) {
+        if (json[i] != '\\' || i + 1 >= json.size()) { url += json[i]; continue; }
+        if (json.compare(i + 1, 5, "u0026") == 0) { url += '&'; i += 5; }
+        else url += json[++i];
+    }
+    return std::wstring(url.begin(), url.end());
+}
+
+// Downloads the wide header (list) and the portrait art (grid).
+void DownloadCover(const std::wstring& appId) {
+    std::error_code ec;
+    unsigned long long id = wcstoull(appId.c_str(), nullptr, 10);
+    const std::wstring base = L"https://cdn.cloudflare.steamstatic.com/steam/apps/" + appId + L"/";
+
+    if (!fs::exists(CoverPath(appId), ec)) {
+        bool got = FetchArt({ base + L"header.jpg" }, CoverPath(appId));
+        if (!got) {
+            std::wstring url = StoreHeaderUrl(appId);
+            got = !url.empty() && FetchArt({ url }, CoverPath(appId));
+        }
+        if (got) PostMessageW(g_mainWnd, WM_COVER, (WPARAM)id, 0);
+    }
+    if (!fs::exists(PortraitPath(appId), ec) && FetchArt({ base + L"library_600x900.jpg" }, PortraitPath(appId)))
+        PostMessageW(g_mainWnd, WM_COVER, (WPARAM)(id | kPortraitFlag), 0);
 }
 
 // Steam's store genres that mark software rather than games (Animation & Modeling, Utilities, ...).
@@ -544,7 +610,8 @@ void QueueBackgroundWork() {
     std::vector<std::wstring> covers, unknown;
     for (const auto& game : g_games) {
         std::error_code ec;
-        if (!fs::exists(CoverPath(game.appId), ec)) covers.push_back(game.appId);
+        if (!fs::exists(CoverPath(game.appId), ec) || !fs::exists(PortraitPath(game.appId), ec))
+            covers.push_back(game.appId);
         if (!g_isGame.count(game.appId)) unknown.push_back(game.appId);
     }
     if (!covers.empty()) g_coverQueue.Push(covers);
@@ -558,10 +625,10 @@ using namespace Gdiplus;
 // Sizes are in 96-dpi pixels and go through S() before use.
 constexpr float kMargin = 24, kRowHeight = 64, kRowInset = 14, kNumberColumn = 52;
 constexpr float kCoverWidth = 96, kCoverHeight = 45;
-constexpr float kChipTop = 92, kChipHeight = 32, kChipGap = 8, kRenameMinWidth = 130;
+constexpr float kChipTop = 108, kChipHeight = 32, kChipGap = 8, kRenameMinWidth = 130;
 constexpr float kMenuWidth = 176, kMenuItemHeight = 38, kMenuPad = 6;
 constexpr float kBarHeight = 76, kControlHeight = 40, kBarMargin = 20, kGap = 8;
-constexpr float kPillWidth = 236, kLaunchWidth = 180;
+constexpr float kPillWidth = 236, kRandomWidth = 190;
 constexpr float kMinClientWidth = 830, kMinClientHeight = 520;
 constexpr float kStartClientWidth = 850, kStartClientHeight = 640;
 
@@ -569,13 +636,16 @@ constexpr int ID_EDIT = 2001;
 constexpr int ID_RENAME_EDIT = 2002;
 constexpr int ID_ACTION = 3000;  // + button index
 constexpr UINT_PTR TIMER_ANIMATION = 1;
-constexpr DWORD WINDOW_STYLE = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
+constexpr DWORD WINDOW_STYLE = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+
+// Wide windows switch from a list to a grid of cards.
+constexpr float kGridMinWidth = 1100, kCardPad = 12, kCardGap = 8, kCardTargetWidth = 200, kCardTextHeight = 58;
 
 constexpr int ID_CREATE_CATEGORY = 3100;
 
-enum { BTN_SCAN, BTN_IMPORT, BTN_LAUNCH, BTN_COUNT };
+enum { BTN_SCAN, BTN_IMPORT, BTN_RANDOM, BTN_COUNT };
 enum class Icon { None, Refresh, Download };
-const wchar_t* const kButtonLabels[BTN_COUNT] = { L"Neu scannen", L"Kategorien aus Steam", L"Zufällig starten" };
+const wchar_t* const kButtonLabels[BTN_COUNT] = { L"Neu scannen", L"Kategorien aus Steam", L"Zufällig auswählen" };
 const Icon kButtonIcons[BTN_COUNT] = { Icon::Refresh, Icon::Download, Icon::None };
 const float kButtonWidths[BTN_COUNT - 1] = { 140, 200 };
 
@@ -602,7 +672,10 @@ struct Layout {
     RECT pill{};
     RECT btn[BTN_COUNT]{};
     std::vector<RECT> chips;
-    int rowH = 0;
+    int rowH = 0;  // vertical step between rows of items (list rows or card rows)
+    int wheelStep = 0;
+    bool grid = false;
+    int cols = 1, cellW = 0, cellH = 0, cardGap = 0, cardPad = 0, artW = 0, artH = 0;
 };
 
 struct Hover {
@@ -644,19 +717,12 @@ struct Badge {
     ULONGLONG hideAfter = 0;  // ms, for Check and Text
 };
 
-// "Zufällig starten": the pick is highlighted for a moment before the game starts.
-struct Shuffle {
-    bool active = false;
-    ULONGLONG launchAt = 0;
-};
-
 float g_scale = 1.0f;
 Layout g_L;
 Hover g_hover;
 DragState g_drag;
 Badge g_badge[BTN_COUNT];
 Toast g_toast;
-Shuffle g_shuffle;
 Badge g_importResult;
 bool g_importReady = false;
 Menu g_menu;
@@ -664,6 +730,7 @@ int g_renameChip = -1;   // category chip being edited in place
 HWND g_renameEdit = nullptr;
 bool g_scanReady = false;
 bool g_tracking = false;
+bool g_fullscreen = false;
 HWND g_edit = nullptr;
 HFONT g_editFont = nullptr;
 HBRUSH g_editBrush = nullptr;
@@ -671,8 +738,6 @@ std::vector<int> g_visible;  // indices into g_games for the current category
 int g_active = 0;            // selected category chip
 int g_sel = -1;              // selected game (index into g_games)
 int g_scroll = 0;
-std::map<unsigned long long, Bitmap*> g_covers;
-std::set<unsigned long long> g_coverTried;
 
 int S(float v) { return (int)std::lround(v * g_scale); }
 
@@ -686,10 +751,14 @@ const std::wstring& SelectedCategory() {
     return g_active >= 0 && g_active < (int)g_categories.size() ? g_categories[g_active] : kAllGames;
 }
 
+int ContentHeight() {
+    int rows = ((int)g_visible.size() + g_L.cols - 1) / g_L.cols;
+    return rows * g_L.rowH;
+}
+
 int MaxScroll() {
-    int content = (int)g_visible.size() * g_L.rowH;
     int view = (int)(g_L.list.bottom - g_L.list.top);
-    return std::max(0, content - view);
+    return std::max(0, ContentHeight() - view);
 }
 
 void ClampScroll() { g_scroll = std::clamp(g_scroll, 0, MaxScroll()); }
@@ -717,6 +786,21 @@ void Relayout(HWND hwnd) {
     int W = rc.right, H = rc.bottom;
 
     g_L.rowH = S(kRowHeight);
+    g_L.cols = 1;
+    g_L.grid = W >= S(kGridMinWidth);
+    if (g_L.grid) {
+        // Portrait art in a grid; the cells stretch so the columns fill the window.
+        g_L.cardPad = S(kCardPad);
+        g_L.cardGap = S(kCardGap);
+        int available = W - 2 * (S(kMargin) - g_L.cardPad);
+        g_L.cols = std::max(1, (available + g_L.cardGap) / (S(kCardTargetWidth) + g_L.cardGap));
+        g_L.cellW = (available - g_L.cardGap * (g_L.cols - 1)) / g_L.cols;
+        g_L.artW = g_L.cellW - 2 * g_L.cardPad;
+        g_L.artH = g_L.artW * 3 / 2;
+        g_L.cellH = g_L.cardPad + g_L.artH + S(10) + S(kCardTextHeight) + g_L.cardPad;
+        g_L.rowH = g_L.cellH + g_L.cardGap;
+    }
+    g_L.wheelStep = g_L.grid ? g_L.rowH / 3 : g_L.rowH;
     g_L.chips.clear();
     {
         Graphics g(hwnd);
@@ -741,11 +825,11 @@ void Relayout(HWND hwnd) {
     int py = g_L.bar.top + (S(kBarHeight) - ph) / 2;
     g_L.pill = { S(kBarMargin), py, S(kBarMargin) + S(kPillWidth), py + ph };
     int x = g_L.pill.right + S(kGap);
-    for (int i = 0; i < BTN_LAUNCH; ++i) {
+    for (int i = 0; i < BTN_RANDOM; ++i) {
         g_L.btn[i] = { x, py, x + S(kButtonWidths[i]), py + ph };
         x += S(kButtonWidths[i]) + S(kGap);
     }
-    g_L.btn[BTN_LAUNCH] = { W - S(kBarMargin) - S(kLaunchWidth), py, W - S(kBarMargin), py + ph };
+    g_L.btn[BTN_RANDOM] = { W - S(kBarMargin) - S(kRandomWidth), py, W - S(kBarMargin), py + ph };
 
     if (g_edit) {
         int eh = S(18), left = g_L.pill.left + S(20);
@@ -764,25 +848,45 @@ void Relayout(HWND hwnd) {
 
 // ---------------------------------------------------------------- covers
 
-Bitmap* GetCover(const std::wstring& appId) {
-    unsigned long long id = wcstoull(appId.c_str(), nullptr, 10);
-    auto it = g_covers.find(id);
-    if (it != g_covers.end()) return it->second;
-    if (!g_coverTried.insert(id).second) return nullptr;
+// Art is loaded lazily and kept; a missing file is only looked up once until its download finishes.
+struct ArtCache {
+    std::map<unsigned long long, Bitmap*> bitmaps;
+    std::set<unsigned long long> tried;
 
-    std::error_code ec;
-    fs::path path = CoverPath(appId);
-    if (!fs::exists(path, ec)) return nullptr;
-    Bitmap* bitmap = Bitmap::FromFile(path.c_str());
-    if (!bitmap || bitmap->GetLastStatus() != Ok) { delete bitmap; return nullptr; }
-    g_covers[id] = bitmap;
-    return bitmap;
-}
+    Bitmap* Get(const std::wstring& appId, const fs::path& path) {
+        unsigned long long id = wcstoull(appId.c_str(), nullptr, 10);
+        auto it = bitmaps.find(id);
+        if (it != bitmaps.end()) return it->second;
+        if (!tried.insert(id).second) return nullptr;
+
+        std::error_code ec;
+        if (!fs::exists(path, ec)) return nullptr;
+        Bitmap* bitmap = Bitmap::FromFile(path.c_str());
+        if (!bitmap || bitmap->GetLastStatus() != Ok) { delete bitmap; return nullptr; }
+        bitmaps[id] = bitmap;
+        return bitmap;
+    }
+
+    void Forget(unsigned long long id) {
+        auto it = bitmaps.find(id);
+        if (it != bitmaps.end()) { delete it->second; bitmaps.erase(it); }
+        tried.erase(id);
+    }
+
+    void Clear() {
+        for (auto& entry : bitmaps) delete entry.second;
+        bitmaps.clear();
+    }
+};
+
+ArtCache g_headers, g_portraits;
+
+Bitmap* GetCover(const std::wstring& appId) { return g_headers.Get(appId, CoverPath(appId)); }
+Bitmap* GetPortrait(const std::wstring& appId) { return g_portraits.Get(appId, PortraitPath(appId)); }
 
 void OnCoverDownloaded(HWND hwnd, unsigned long long id) {
-    auto it = g_covers.find(id);
-    if (it != g_covers.end()) { delete it->second; g_covers.erase(it); }
-    g_coverTried.erase(id);
+    if (id & kPortraitFlag) g_portraits.Forget(id & ~kPortraitFlag);
+    else g_headers.Forget(id);
     Redraw(hwnd);
 }
 
@@ -818,15 +922,16 @@ void StrokePill(Graphics& g, RectF r, const Color& color, REAL width, bool dashe
     g.DrawPath(&pen, &path);
 }
 
+// `wrap` lets the text use as many lines as the rectangle holds and ends the last one with an ellipsis.
 void DrawLabel(Graphics& g, const std::wstring& text, REAL px, bool bold, const Color& color, RectF r,
-    StringAlignment h = StringAlignmentNear, StringAlignment v = StringAlignmentNear) {
+    StringAlignment h = StringAlignmentNear, StringAlignment v = StringAlignmentNear, bool wrap = false) {
     FontFamily family(L"Arial");
     Font font(&family, px, bold ? FontStyleBold : FontStyleRegular, UnitPixel);
     StringFormat format;
     format.SetAlignment(h);
     format.SetLineAlignment(v);
-    format.SetTrimming(StringTrimmingEllipsisCharacter);
-    format.SetFormatFlags(StringFormatFlagsNoWrap);
+    format.SetTrimming(wrap ? StringTrimmingEllipsisWord : StringTrimmingEllipsisCharacter);
+    format.SetFormatFlags(wrap ? StringFormatFlagsLineLimit : StringFormatFlagsNoWrap);
     SolidBrush brush(color);
     g.DrawString(text.c_str(), -1, &font, r, &format, &brush);
 }
@@ -880,22 +985,80 @@ void DrawBadge(Graphics& g, RectF r, const Badge& badge, const Color& ink = kTex
 
 // ---------------------------------------------------------------- rows
 
-RECT CoverRect(int rowTop) {
+// Geometry of item `i` (visible index): a list row, or a card in the grid.
+int ItemTop(int i) { return g_L.list.top + (i / g_L.cols) * g_L.rowH - g_scroll; }
+
+RECT ItemCell(int i) {
+    int top = ItemTop(i);
+    if (!g_L.grid) return { 0, top, (int)g_L.list.right, top + g_L.rowH };
+    int left = S(kMargin) - g_L.cardPad + (i % g_L.cols) * (g_L.cellW + g_L.cardGap);
+    return { left, top, left + g_L.cellW, top + g_L.cellH };
+}
+
+RECT ArtRect(int i) {
+    RECT cell = ItemCell(i);
+    if (g_L.grid) {
+        int left = cell.left + g_L.cardPad, top = cell.top + g_L.cardPad;
+        return { left, top, left + g_L.artW, top + g_L.artH };
+    }
     int left = S(kRowInset) + S(kNumberColumn);
-    int top = rowTop + S(2) + (g_L.rowH - S(4) - S(kCoverHeight)) / 2;
+    int top = cell.top + S(2) + (g_L.rowH - S(4) - S(kCoverHeight)) / 2;
     return { left, top, left + S(kCoverWidth), top + S(kCoverHeight) };
 }
 
-int RowTop(int visibleIndex) { return g_L.list.top + visibleIndex * g_L.rowH - g_scroll; }
+// The area that starts the game when clicked: the whole cover in the list, the round button on a card.
+RECT PlayRect(int i) {
+    RECT art = ArtRect(i);
+    if (!g_L.grid) return art;
+    int d = S(44), inset = S(8);
+    return { art.right - inset - d, art.bottom - inset - d, art.right - inset, art.bottom - inset };
+}
 
-bool InCover(int visibleIndex, POINT p) {
-    if (visibleIndex < 0) return false;
-    RECT r = CoverRect(RowTop(visibleIndex));
+bool InPlayZone(int i, POINT p) {
+    if (i < 0) return false;
+    RECT r = PlayRect(i);
     return In(r, p);
 }
 
+std::wstring Plural(long long n, const wchar_t* one, const wchar_t* many) {
+    return std::to_wstring(n) + L" " + (n == 1 ? one : many);
+}
+
+// "36 Std. · Zuletzt gespielt vor 3 Tagen"
+std::wstring PlayInfo(const Game& game) {
+    if (game.playtimeMinutes == 0 && game.lastPlayed == 0) return L"Noch nicht gespielt";
+
+    std::wstring parts;
+    if (game.playtimeMinutes > 0) {
+        if (game.playtimeMinutes < 60) {
+            parts = std::to_wstring(game.playtimeMinutes) + L" Min.";
+        } else if (game.playtimeMinutes < 600) {
+            wchar_t hours[32];
+            swprintf_s(hours, L"%.1f", game.playtimeMinutes / 60.0);
+            std::wstring text = hours;
+            std::replace(text.begin(), text.end(), L'.', L',');
+            parts = text + L" Std.";
+        } else {
+            parts = std::to_wstring(game.playtimeMinutes / 60) + L" Std.";
+        }
+    }
+    if (game.lastPlayed > 0) {
+        long long days = (std::time(nullptr) - game.lastPlayed) / 86400;
+        std::wstring when;
+        if (days <= 0) when = L"heute";
+        else if (days == 1) when = L"gestern";
+        else if (days < 14) when = L"vor " + std::to_wstring(days) + L" Tagen";
+        else if (days < 60) when = L"vor " + std::to_wstring(days / 7) + L" Wochen";
+        else if (days < 365) when = L"vor " + std::to_wstring(days / 30) + L" Monaten";
+        else when = L"vor " + Plural(days / 365, L"Jahr", L"Jahren");
+        if (!parts.empty()) parts += L"  ·  ";
+        parts += L"Zuletzt gespielt " + when;
+    }
+    return parts;
+}
+
 void DrawRow(Graphics& g, int visibleIndex, int W) {
-    int rowTop = RowTop(visibleIndex);
+    int rowTop = ItemTop(visibleIndex);
     const Game& game = g_games[g_visible[visibleIndex]];
     bool selected = g_visible[visibleIndex] == g_sel;
     bool hover = visibleIndex == g_hover.row;
@@ -907,7 +1070,7 @@ void DrawRow(Graphics& g, int visibleIndex, int W) {
     DrawCentered(g, std::to_wstring(visibleIndex + 1), (REAL)S(15), false, selected ? kAccentHover : kText2,
         RectF(slot.X, slot.Y, (REAL)S(kNumberColumn), slot.Height));
 
-    RectF cover = RF(CoverRect(rowTop));
+    RectF cover = RF(ArtRect(visibleIndex));
     GraphicsPath clip;
     RoundPath(clip, cover, (REAL)S(5));
     if (Bitmap* bitmap = GetCover(game.appId)) {
@@ -931,9 +1094,55 @@ void DrawRow(Graphics& g, int visibleIndex, int W) {
         DrawPlayTriangle(g, cx, cy, (REAL)S(12), hot ? kOnAccent : kText);
     }
 
-    REAL tx = cover.GetRight() + S(16);
-    DrawLabel(g, game.name, (REAL)S(15), true, selected ? kAccentHover : kText,
-        RectF(tx, slot.Y, slot.GetRight() - tx - S(16), slot.Height), StringAlignmentNear, StringAlignmentCenter);
+    REAL tx = cover.GetRight() + S(16), tw = slot.GetRight() - tx - S(16);
+    DrawLabel(g, game.name, (REAL)S(15), true, selected ? kAccentHover : kText, RectF(tx, slot.Y + S(10), tw, (REAL)S(22)));
+    DrawLabel(g, PlayInfo(game), (REAL)S(13), false, kText2, RectF(tx, slot.Y + S(32), tw, (REAL)S(18)));
+}
+
+// A card in the grid, modeled on Spotify's: art with a round play button, then title and details.
+void DrawCard(Graphics& g, int visibleIndex) {
+    const Game& game = g_games[g_visible[visibleIndex]];
+    bool selected = g_visible[visibleIndex] == g_sel;
+    bool hover = visibleIndex == g_hover.row && !g_drag.active;
+
+    RectF cell = RF(ItemCell(visibleIndex));
+    if (selected) FillRound(g, cell, (REAL)S(8), kSurface);
+    else if (hover) FillRound(g, cell, (REAL)S(8), kSurfaceHover);
+
+    RectF art = RF(ArtRect(visibleIndex));
+    GraphicsPath clip;
+    RoundPath(clip, art, (REAL)S(6));
+    GraphicsState state = g.Save();
+    g.SetClip(&clip, CombineModeIntersect);
+    if (Bitmap* portrait = GetPortrait(game.appId)) {
+        g.DrawImage(portrait, art);
+    } else if (Bitmap* header = GetCover(game.appId)) {
+        // No portrait art: fill the card with the middle of the wide header.
+        REAL sourceH = (REAL)header->GetHeight(), sourceW = sourceH * art.Width / art.Height;
+        g.DrawImage(header, art, ((REAL)header->GetWidth() - sourceW) / 2, 0, sourceW, sourceH, UnitPixel);
+    } else {
+        SolidBrush brush(kCover);
+        g.FillPath(&brush, &clip);
+        DrawCentered(g, game.name.substr(0, 1), (REAL)S(40), true, kAccentHover, art);
+    }
+    g.Restore(state);
+
+    if (hover || selected) {
+        RectF play = RF(PlayRect(visibleIndex));
+        bool hot = hover && g_hover.cover;
+        REAL grow = hot ? (REAL)S(3) : 0.0f;
+        RectF disc(play.X - grow, play.Y - grow, play.Width + 2 * grow, play.Height + 2 * grow);
+        SolidBrush shadow(Color(80, 0, 0, 0));
+        g.FillEllipse(&shadow, disc.X, disc.Y + 2, disc.Width, disc.Height);
+        SolidBrush brush(hot ? kAccentHover : kAccent);
+        g.FillEllipse(&brush, disc);
+        DrawPlayTriangle(g, disc.X + disc.Width / 2, disc.Y + disc.Height / 2, (REAL)S(16), kOnAccent);
+    }
+
+    REAL textTop = art.GetBottom() + S(10);
+    DrawLabel(g, game.name, (REAL)S(15), true, selected ? kAccentHover : kText, RectF(art.X, textTop, art.Width, (REAL)S(20)));
+    DrawLabel(g, PlayInfo(game), (REAL)S(13), false, kText2,
+        RectF(art.X, textTop + S(22), art.Width, (REAL)S(34)), StringAlignmentNear, StringAlignmentNear, true);
 }
 
 // ---------------------------------------------------------------- frame
@@ -967,12 +1176,14 @@ void DrawList(Graphics& g, int W) {
         DrawLabel(g, L"Wähle eine andere Kategorie oder scanne Steam neu.", (REAL)S(13), false, kText2,
             RectF(listRect.X, listRect.Y + S(70), listRect.Width, (REAL)S(20)), StringAlignmentCenter);
     } else {
-        for (int i = g_scroll / g_L.rowH; i < (int)g_visible.size() && RowTop(i) < g_L.list.bottom; ++i)
-            DrawRow(g, i, W);
+        for (int i = (g_scroll / g_L.rowH) * g_L.cols; i < (int)g_visible.size() && ItemTop(i) < g_L.list.bottom; ++i) {
+            if (g_L.grid) DrawCard(g, i);
+            else DrawRow(g, i, W);
+        }
 
         int maxScroll = MaxScroll();
         if (maxScroll > 0) {
-            REAL view = listRect.Height, content = (REAL)(g_visible.size() * g_L.rowH);
+            REAL view = listRect.Height, content = (REAL)ContentHeight();
             REAL thumbH = std::max((REAL)S(32), view * view / content);
             REAL thumbY = listRect.Y + (view - thumbH) * g_scroll / maxScroll;
             FillRound(g, RectF((REAL)(W - S(8)), thumbY, (REAL)S(4), thumbH), (REAL)S(2), Color(90, 255, 255, 255));
@@ -1047,10 +1258,9 @@ void DrawBar(Graphics& g, int W, int H) {
     for (int i = 0; i < BTN_COUNT; ++i) {
         RectF r = RF(g_L.btn[i]);
         bool hover = i == g_hover.button;
-        if (i == BTN_LAUNCH) {
-            FillRound(g, r, r.Height / 2, hover && !g_shuffle.active ? kAccentHover : kAccent);
-            if (g_badge[i].mode != Badge::Off) DrawBadge(g, r, g_badge[i], kOnAccent, kOnAccent);
-            else DrawCentered(g, kButtonLabels[i], (REAL)S(14), true, kOnAccent, r);
+        if (i == BTN_RANDOM) {
+            FillRound(g, r, r.Height / 2, hover ? kAccentHover : kAccent);
+            DrawCentered(g, kButtonLabels[i], (REAL)S(14), true, kOnAccent, r);
             continue;
         }
         bool busy = g_badge[i].mode != Badge::Off;
@@ -1109,13 +1319,16 @@ void DrawUi(Graphics& g, int W, int H) {
     SolidBrush bg(kBg);
     g.FillRectangle(&bg, 0, 0, W, H);
 
-    DrawLabel(g, L"Deine Spiele", (REAL)S(30), true, kText,
-        RectF((REAL)S(kMargin), (REAL)S(18), (REAL)(W - 2 * S(kMargin)), (REAL)S(40)));
+    RectF header((REAL)S(kMargin), 0, (REAL)(W - 2 * S(kMargin)), 0);
+    DrawLabel(g, g_steamName.empty() ? L"Deine Steam-Bibliothek" : L"Bibliothek von " + g_steamName, (REAL)S(13), true, kText2,
+        RectF(header.X, (REAL)S(16), header.Width, (REAL)S(18)));
+    DrawLabel(g, std::to_wstring(g_games.size()) + (g_games.size() == 1 ? L" Spiel" : L" Spiele"), (REAL)S(38), true, kText,
+        RectF(header.X, (REAL)S(32), header.Width, (REAL)S(48)));
     std::wstring hint = L"Zieh ein Spiel auf eine Kategorie, um es zuzuordnen";
     if (g_drag.active) hint = L"Lass das Spiel auf einer Kategorie los, um es zuzuordnen";
     else if (g_categories.size() <= 1) hint = L"Lege unten eine Kategorie an und zieh Spiele hinein";
     DrawLabel(g, hint, (REAL)S(13), false, kText2,
-        RectF((REAL)S(kMargin), (REAL)S(60), (REAL)(W - 2 * S(kMargin)), (REAL)S(20)));
+        RectF((REAL)S(kMargin), (REAL)S(82), (REAL)(W - 2 * S(kMargin)), (REAL)S(20)));
 
     DrawChips(g);
     DrawList(g, W);
@@ -1155,8 +1368,16 @@ void Paint(HWND hwnd) {
 
 int HitRow(POINT p) {
     if (!In(g_L.list, p)) return -1;
-    int index = (p.y - g_L.list.top + g_scroll) / g_L.rowH;
-    return index >= 0 && index < (int)g_visible.size() ? index : -1;
+    int row = (p.y - g_L.list.top + g_scroll) / g_L.rowH, col = 0;
+    if (g_L.grid) {
+        int x = p.x - (S(kMargin) - g_L.cardPad);
+        if (x < 0) return -1;
+        col = x / (g_L.cellW + g_L.cardGap);
+        if (col >= g_L.cols) return -1;
+    }
+    int index = row * g_L.cols + col;
+    if (row < 0 || index >= (int)g_visible.size()) return -1;
+    return In(ItemCell(index), p) ? index : -1;  // the gaps between cards hit nothing
 }
 
 int HitButton(POINT p) {
@@ -1176,7 +1397,7 @@ void UpdateHover(HWND hwnd, POINT p) {
     next.row = HitRow(p);
     next.button = HitButton(p);
     next.chip = HitChip(p);
-    next.cover = InCover(next.row, p);
+    next.cover = InPlayZone(next.row, p);
     if (g_menu.open) {
         // The menu sits on top, so it hides whatever is underneath.
         next = Hover{};
@@ -1191,7 +1412,7 @@ void UpdateHover(HWND hwnd, POINT p) {
 }
 
 void EnsureVisible(int visibleIndex) {
-    int top = visibleIndex * g_L.rowH, view = g_L.list.bottom - g_L.list.top;
+    int top = (visibleIndex / g_L.cols) * g_L.rowH, view = g_L.list.bottom - g_L.list.top;
     if (top < g_scroll) g_scroll = top;
     else if (top + g_L.rowH > g_scroll + view) g_scroll = top + g_L.rowH - view;
     ClampScroll();
@@ -1338,42 +1559,28 @@ void ShowBadge(HWND hwnd, int button, Badge::Mode mode, const std::wstring& text
     InvalidateRect(hwnd, &g_L.btn[button], FALSE);
 }
 
-void StartShuffle(HWND hwnd) {
-    if (g_shuffle.active) return;
+// Selects a random game of the current category, different from the current selection. Starting is up to the user.
+void SelectRandomGame(HWND hwnd) {
     if (g_visible.empty()) {
         ShowToast(hwnd, L"In dieser Kategorie sind keine Spiele");
         return;
     }
-    if (g_visible.size() == 1) {
-        LaunchGame(hwnd, g_games[g_visible[0]]);
-        return;
-    }
+    std::vector<int> choices;
+    for (int i = 0; i < (int)g_visible.size(); ++i)
+        if (g_visible[i] != g_sel) choices.push_back(i);
+    if (choices.empty()) choices.push_back(0);
+
     std::random_device rd;
     std::mt19937 rng(rd());
-    std::uniform_int_distribution<int> pick(0, (int)g_visible.size() - 1);
-    int index = pick(rng);
+    int index = choices[std::uniform_int_distribution<size_t>(0, choices.size() - 1)(rng)];
     g_sel = g_visible[index];
     EnsureVisible(index);
     Redraw(hwnd);
-    g_shuffle.active = true;
-    g_shuffle.launchAt = GetTickCount64() + 700;
-    ShowBadge(hwnd, BTN_LAUNCH, Badge::Check, L"Los geht’s", 5000);
-}
-
-// Shows the pick and the check mark for a moment before the game starts.
-void TickShuffle(HWND hwnd, ULONGLONG now) {
-    if (now < g_shuffle.launchAt) return;
-    g_shuffle.active = false;
-    if (g_sel >= 0) LaunchGame(hwnd, g_games[g_sel]);
 }
 
 void TickBadges(HWND hwnd) {
     ULONGLONG now = GetTickCount64();
     bool anyActive = false;
-    if (g_shuffle.active) {
-        TickShuffle(hwnd, now);
-        anyActive = true;
-    }
     for (int i = 0; i < BTN_COUNT; ++i) {
         Badge& badge = g_badge[i];
         if (badge.mode == Badge::Off) continue;
@@ -1468,7 +1675,29 @@ void DropOnCategory(HWND hwnd) {
     }
 }
 
+// F11: borderless fullscreen on the current monitor, and back to the previous window position.
+void ToggleFullscreen(HWND hwnd) {
+    static WINDOWPLACEMENT previous{ sizeof(WINDOWPLACEMENT) };
+    if (!g_fullscreen) {
+        MONITORINFO monitor{ sizeof(monitor) };
+        if (!GetWindowPlacement(hwnd, &previous) || !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor))
+            return;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WINDOW_STYLE & ~WS_OVERLAPPEDWINDOW) | WS_VISIBLE);
+        SetWindowPos(hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
+            monitor.rcMonitor.right - monitor.rcMonitor.left, monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+            SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_fullscreen = true;
+    } else {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, WINDOW_STYLE | WS_VISIBLE);
+        SetWindowPlacement(hwnd, &previous);
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_fullscreen = false;
+    }
+}
+
 LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_KEYDOWN && wp == VK_F11) { ToggleFullscreen(GetParent(hwnd)); return 0; }
     if (msg == WM_CHAR) {
         if (wp == VK_RETURN) { CommitRename(GetParent(hwnd)); return 0; }
         if (wp == VK_ESCAPE) { EndRename(GetParent(hwnd), true); return 0; }
@@ -1477,6 +1706,7 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_
 }
 
 LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_KEYDOWN && wp == VK_F11) { ToggleFullscreen(GetParent(hwnd)); return 0; }
     if (msg == WM_CHAR) {
         if (wp == VK_RETURN) {
             SendMessageW(GetParent(hwnd), WM_COMMAND, MAKEWPARAM(ID_CREATE_CATEGORY, BN_CLICKED), 0);
@@ -1515,7 +1745,7 @@ void OnMouseDown(HWND hwnd, UINT msg, LPARAM lp) {
     } else if (row >= 0) {
         g_sel = g_visible[row];
         Redraw(hwnd);
-        if (msg == WM_LBUTTONDBLCLK || InCover(row, p)) {
+        if (msg == WM_LBUTTONDBLCLK || InPlayZone(row, p)) {
             LaunchGame(hwnd, g_games[g_sel]);
         } else {
             g_drag.row = row;
@@ -1545,15 +1775,25 @@ void OnMouseMove(HWND hwnd, WPARAM wp, LPARAM lp) {
 }
 
 void OnKeyDown(HWND hwnd, WPARAM key) {
-    if (key == VK_ESCAPE && g_menu.open) {
-        CloseMenu(hwnd);
+    if (key == VK_F11) {
+        ToggleFullscreen(hwnd);
         return;
     }
-    if ((key != VK_UP && key != VK_DOWN) || g_visible.empty()) return;
+    if (key == VK_ESCAPE) {
+        if (g_menu.open) CloseMenu(hwnd);
+        else if (g_fullscreen) ToggleFullscreen(hwnd);
+        return;
+    }
+    bool vertical = key == VK_UP || key == VK_DOWN, horizontal = g_L.grid && (key == VK_LEFT || key == VK_RIGHT);
+    if ((!vertical && !horizontal) || g_visible.empty()) return;
+
+    // Up and down move by a row (several cards in the grid), left and right by one card.
+    int step = vertical ? g_L.cols : 1;
     int current = -1;
     for (int i = 0; i < (int)g_visible.size(); ++i)
         if (g_visible[i] == g_sel) current = i;
-    int next = std::clamp(current + (key == VK_DOWN ? 1 : -1), 0, (int)g_visible.size() - 1);
+    int direction = (key == VK_DOWN || key == VK_RIGHT) ? 1 : -1;
+    int next = std::clamp(current < 0 ? 0 : current + direction * step, 0, (int)g_visible.size() - 1);
     g_sel = g_visible[next];
     EnsureVisible(next);
     Redraw(hwnd);
@@ -1586,8 +1826,8 @@ void OnDestroy() {
     SaveSettings();
     if (g_editFont) DeleteObject(g_editFont);
     if (g_editBrush) DeleteObject(g_editBrush);
-    for (auto& entry : g_covers) delete entry.second;
-    g_covers.clear();
+    g_headers.Clear();
+    g_portraits.Clear();
     PostQuitMessage(0);
 }
 
@@ -1639,7 +1879,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_MOUSEWHEEL: {
         CloseMenu(hwnd);
-        g_scroll -= GET_WHEEL_DELTA_WPARAM(wp) * g_L.rowH / WHEEL_DELTA;
+        g_scroll -= GET_WHEEL_DELTA_WPARAM(wp) * g_L.wheelStep / WHEEL_DELTA;
         ClampScroll();
         POINT p;
         GetCursorPos(&p);
@@ -1692,7 +1932,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (id - ID_ACTION) {
         case BTN_SCAN: Rescan(hwnd); return 0;
         case BTN_IMPORT: ImportFromSteam(hwnd); return 0;
-        case BTN_LAUNCH: StartShuffle(hwnd); return 0;
+        case BTN_RANDOM: SelectRandomGame(hwnd); return 0;
         }
         break;
     }
@@ -1740,6 +1980,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     CreateDirectoryW(g_coverDir.c_str(), nullptr);
     LoadSettings();
     LoadTypes();
+    g_steamName = SteamPersonaName();
     MergeGames(ScanSteamGames());
 
     const wchar_t className[] = L"SteamGameRandomizerWindow";

@@ -6,6 +6,7 @@ Startet ein zufälliges installiertes Steam-Spiel. Die Oberfläche ist an Spotif
 - Titelbilder kommen von Steam und werden lokal zwischengespeichert
 - Eigene Kategorien: Spiele per Drag and Drop auf eine Kategorie ziehen, Rechtsklick auf eine Kategorie öffnet ein Menü zum Umbenennen und Löschen
 - „Aus Steam holen“ importiert deine Steam-Sammlungen (nur die mit installierten Spielen)
+- Ab einer Fensterbreite von etwa 1100 Pixeln (Maximieren oder F11 für Vollbild) wird aus der Liste ein Raster aus Karten mit Hochformat-Cover
 - Ein Klick auf das Titelbild startet genau dieses Spiel, „Zufällig starten“ wählt eins aus der aktuellen Kategorie
 
 ## Bauen
