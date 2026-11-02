@@ -1,10 +1,17 @@
-﻿# Steam Game Randomizer
+# Steam Game Randomizer
 
 Eine kleine Windows-App, die deine installierten Steam-Spiele zeigt und dir hilft, eins auszuwählen. Die Oberfläche ist an Spotifys Darkmode angelehnt.
 
-- Liest die installierten Spiele aus allen Steam-Bibliotheken, mit Titelbild, Spielzeit, zuletzt gespielt und Größe
+![Listenansicht](screenshots/liste.png)
+
+![Kartenansicht](screenshots/karten.png)
+
+*Screenshots von Version 1.6.0.*
+
+- Liest die installierten Spiele aus allen Steam-Bibliotheken, mit Titelbild, Spielzeit, zuletzt gespielt, Größe und Erfolgsfortschritt
+- Zeigt auch Spiele, die du besitzt, aber nicht installiert hast, grau und ohne Start-Button
 - Eigene Kategorien wie Playlists, auch aus deinen Steam-Sammlungen importierbar
-- Sortieren, Listen- und Kartenansicht, zufälliges Spiel auswählen
+- Suche, Sortieren, Listen- und Kartenansicht, zufälliges Spiel auswählen
 
 Geschrieben in C++ mit der Win32-API und GDI+, ohne weitere Abhängigkeiten. Einstellungen und Bilder liegen unter `%APPDATA%\GameRandomizer`.
 

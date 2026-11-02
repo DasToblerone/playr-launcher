@@ -56,6 +56,8 @@ struct Game {
     int playtimeMinutes = 0;
     long long lastPlayed = 0;  // unix time, 0 when never played
     long long sizeBytes = 0;   // install size from the Steam manifest, 0 when unknown
+    bool installed = true;     // false for games the account owns but that are not on this PC
+    int achTotal = 0, achDone = 0;  // achievements, 0 total when Steam has no data for the game
 
     bool InCategory(const std::wstring& category) const {
         return std::find(categories.begin(), categories.end(), category) != categories.end();
@@ -76,10 +78,12 @@ const std::wstring kAllGames = L"Alle Spiele";
 enum class SortKey { Name, Playtime, LastPlayed, Size };
 SortKey g_sortKey = SortKey::Name;
 bool g_sortDescending = false;
+bool g_showUninstalled = true;
 
 std::vector<Game> g_games;
 std::vector<std::wstring> g_categories{ kAllGames };  // sidebar rows; "Alle Spiele" is always the first
 std::map<std::wstring, bool> g_isGame;   // appId -> verdict from the Steam store, cached on disk
+std::map<std::wstring, std::wstring> g_ownedNames;  // appId -> name of owned games that are not installed, cached on disk
 
 std::wstring g_dataDir;
 std::wstring g_coverDir;
@@ -88,6 +92,7 @@ std::wstring g_steamId;    // its SteamID64, which names the avatar file in Stea
 
 fs::path SettingsPath() { return fs::path(g_dataDir) / L"settings.txt"; }
 fs::path TypesPath() { return fs::path(g_dataDir) / L"types.txt"; }
+fs::path OwnedPath() { return fs::path(g_dataDir) / L"owned.txt"; }
 fs::path CoverPath(const std::wstring& appId) { return fs::path(g_coverDir) / (appId + L".jpg"); }
 fs::path PortraitPath(const std::wstring& appId) { return fs::path(g_coverDir) / (appId + L"_p.jpg"); }
 
@@ -256,15 +261,14 @@ struct ImportResult {
     int games = 0;
 };
 
-// Steam keeps collections in userdata/<account>/config/cloudstorage. Only collections that hold at
-// least one installed game are imported; their games are added to the category of the same name.
-ImportResult ImportSteamCategories() {
-    struct Collection {
-        std::wstring name;
-        std::vector<Game*> members;
-    };
-    std::vector<Collection> collections;
+struct SteamCollection {
+    std::wstring name;
+    std::vector<std::wstring> appIds;
+};
 
+// Steam keeps collections in userdata/<account>/config/cloudstorage. The hidden list is skipped.
+std::vector<SteamCollection> ReadSteamCollections() {
+    std::vector<SteamCollection> collections;
     std::error_code ec;
     std::wstring steam = SteamPath();
     if (!steam.empty()) {
@@ -285,21 +289,37 @@ ImportResult ImportSteamCategories() {
                 size_t addedPos = inner.find(L"\"added\":[");
                 if (namePos == std::wstring::npos || addedPos == std::wstring::npos) continue;
 
-                Collection collection;
+                SteamCollection collection;
                 collection.name = ReadJsonString(inner, namePos + 8);
                 size_t listEnd = inner.find(L']', addedPos);
                 std::wstring list = inner.substr(addedPos + 9, listEnd - addedPos - 9);
                 for (size_t start = 0; start < list.size();) {
                     size_t comma = list.find(L',', start);
                     if (comma == std::wstring::npos) comma = list.size();
-                    std::wstring id = list.substr(start, comma - start);
-                    for (auto& game : g_games)
-                        if (game.appId == id) collection.members.push_back(&game);
+                    collection.appIds.push_back(list.substr(start, comma - start));
                     start = comma + 1;
                 }
-                if (!collection.name.empty() && !collection.members.empty()) collections.push_back(collection);
+                if (!collection.name.empty() && !collection.appIds.empty()) collections.push_back(collection);
             }
         }
+    }
+    return collections;
+}
+
+// Adds the games of every Steam collection that holds at least one game of the library to the category of the same name.
+ImportResult ImportSteamCategories() {
+    struct Collection {
+        std::wstring name;
+        std::vector<Game*> members;
+    };
+    std::vector<Collection> collections;
+    for (const auto& raw : ReadSteamCollections()) {
+        Collection collection;
+        collection.name = raw.name;
+        for (const auto& id : raw.appIds)
+            for (auto& game : g_games)
+                if (game.appId == id) collection.members.push_back(&game);
+        if (!collection.members.empty()) collections.push_back(collection);
     }
 
     ImportResult result;
@@ -332,6 +352,7 @@ void SaveSettings() {
         file << "\r\n";
     }
     file << "S\t" << (int)g_sortKey << '\t' << (g_sortDescending ? 1 : 0) << "\r\n";
+    file << "U\t" << (g_showUninstalled ? 1 : 0) << "\r\n";
     for (const auto& game : g_games) {
         for (const auto& category : game.categories) {  // one line per membership
             file << "G\t";
@@ -355,6 +376,8 @@ void LoadSettings() {
             int key = _wtoi(line.substr(2, split == std::wstring::npos ? split : split - 2).c_str());
             if (key >= 0 && key <= (int)SortKey::Size) g_sortKey = (SortKey)key;
             g_sortDescending = split != std::wstring::npos && line.compare(split + 1, 1, L"1") == 0;
+        } else if (line.rfind(L"U\t", 0) == 0) {
+            g_showUninstalled = line.compare(2, 1, L"0") != 0;
         } else if (line.rfind(L"G\t", 0) == 0) {
             size_t split = line.find(L'\t', 2);
             if (split == std::wstring::npos) return;
@@ -381,6 +404,23 @@ void LoadTypes() {
         size_t split = line.find(L'\t');
         if (split != std::wstring::npos && split + 1 < line.size())
             g_isGame[line.substr(0, split)] = line[split + 1] == L'1';
+    });
+}
+
+void SaveOwned() {
+    std::ofstream file(OwnedPath(), std::ios::binary | std::ios::trunc);
+    for (const auto& entry : g_ownedNames) {
+        WriteUtf8(file, entry.first);
+        file << '\t';
+        WriteUtf8(file, entry.second);
+        file << "\r\n";
+    }
+}
+
+void LoadOwned() {
+    ForEachLine(ReadTextFile(OwnedPath()), [](const std::wstring& line) {
+        size_t split = line.find(L'\t');
+        if (split != std::wstring::npos && split + 1 < line.size()) g_ownedNames[line.substr(0, split)] = line.substr(split + 1);
     });
 }
 
@@ -412,13 +452,28 @@ size_t BlockEnd(const std::wstring& text, size_t open) {
     return text.size();
 }
 
-// Reads play time (minutes) and last played (unix time) per app from Steam's localconfig.vdf.
-void ApplyPlayStats() {
+// Reads the number of achievements from the per-app cache of the Steam client (nTotal and nAchieved).
+void ReadAchievements(const fs::path& cacheDir, Game& game) {
+    std::wstring text = ReadTextFile(cacheDir / (game.appId + L".json"));
+    size_t total = text.find(L"\"nTotal\":"), done = text.find(L"\"nAchieved\":");
+    if (total == std::wstring::npos || done == std::wstring::npos) return;
+    int t = _wtoi(text.c_str() + total + 9), d = _wtoi(text.c_str() + done + 12);
+    if (t > game.achTotal) {
+        game.achTotal = t;
+        game.achDone = d;
+    }
+}
+
+// Reads play time (minutes) and last played (unix time) per app from Steam's localconfig.vdf, and the
+// achievement counts from the client's cache. With `only`, just that app is updated.
+void ApplyPlayStats(const std::wstring& only = L"") {
     std::error_code ec;
     for (fs::directory_iterator it(fs::path(SteamPath()) / L"userdata", ec), end; !ec && it != end; it.increment(ec)) {
         std::wstring text = ReadTextFile(it->path() / L"config" / L"localconfig.vdf");
         if (text.empty()) continue;
         for (auto& game : g_games) {
+            if (!only.empty() && game.appId != only) continue;
+            ReadAchievements(it->path() / L"config" / L"librarycache", game);
             const std::wstring marker = L"\"" + game.appId + L"\"";
             for (size_t pos = 0; (pos = text.find(marker, pos)) != std::wstring::npos; pos += marker.size()) {
                 size_t open = text.find_first_not_of(L" \t\r\n", pos + marker.size());
@@ -434,7 +489,31 @@ void ApplyPlayStats() {
     }
 }
 
-// Replaces the game list with `detected`, keeping saved category assignments and dropping known non-games.
+// Games the account owns beyond the installed ones. Steam has no local list of them, so this collects the apps that
+// have play time in localconfig.vdf and the games in the user's collections. The store then says which are real games.
+std::set<std::wstring> FindOwnedCandidates() {
+    std::set<std::wstring> ids;
+    std::error_code ec;
+    for (fs::directory_iterator it(fs::path(SteamPath()) / L"userdata", ec), end; !ec && it != end; it.increment(ec)) {
+        std::wstring text = ReadTextFile(it->path() / L"config" / L"localconfig.vdf");
+        for (size_t pos = 0; (pos = text.find(L"\"LastPlayed\"", pos)) != std::wstring::npos; pos += 12) {
+            // The key of the block that holds LastPlayed is the app id.
+            size_t open = text.rfind(L'{', pos);
+            if (open == std::wstring::npos || open == 0) continue;
+            size_t keyEnd = text.rfind(L'"', open), keyStart = keyEnd == std::wstring::npos || keyEnd == 0
+                ? std::wstring::npos : text.rfind(L'"', keyEnd - 1);
+            if (keyStart == std::wstring::npos) continue;
+            std::wstring key = text.substr(keyStart + 1, keyEnd - keyStart - 1);
+            if (!key.empty() && std::all_of(key.begin(), key.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; })) ids.insert(key);
+        }
+    }
+    for (const auto& collection : ReadSteamCollections())
+        ids.insert(collection.appIds.begin(), collection.appIds.end());
+    return ids;
+}
+
+// Replaces the game list with `detected` plus the owned games that are not installed, keeping saved category
+// assignments and dropping known non-games.
 void MergeGames(const std::map<std::wstring, Game>& detected) {
     std::map<std::wstring, std::vector<std::wstring>> assignments;
     for (const auto& game : g_games)
@@ -449,6 +528,19 @@ void MergeGames(const std::map<std::wstring, Game>& detected) {
         for (const auto& category : assignments[game.appId])
             if (std::find(g_categories.begin(), g_categories.end(), category) != g_categories.end())
                 game.AddCategory(category);  // categories that no longer exist are dropped
+        g_games.push_back(game);
+    }
+    for (const auto& owned : g_ownedNames) {
+        if (detected.count(owned.first)) continue;
+        auto verdict = g_isGame.find(owned.first);
+        if (verdict != g_isGame.end() && !verdict->second) continue;
+        Game game;
+        game.appId = owned.first;
+        game.name = owned.second;
+        game.installed = false;
+        for (const auto& category : assignments[game.appId])
+            if (std::find(g_categories.begin(), g_categories.end(), category) != g_categories.end())
+                game.AddCategory(category);
         g_games.push_back(game);
     }
     std::sort(g_games.begin(), g_games.end(), [](const Game& a, const Game& b) {
@@ -555,6 +647,7 @@ constexpr UINT WM_COVER = WM_APP + 1;       // wParam: appId whose art finished 
 constexpr unsigned long long kPortraitFlag = 1ull << 62;
 constexpr UINT WM_SCANDONE = WM_APP + 2;    // lParam: heap-allocated std::map<std::wstring, Game>
 constexpr UINT WM_CLASSIFIED = WM_APP + 3;  // wParam: appId, lParam: 1 when it is a game
+constexpr UINT WM_OWNED = WM_APP + 4;       // lParam: heap-allocated OwnedResult
 
 HWND g_mainWnd = nullptr;
 
@@ -616,39 +709,83 @@ bool IsSoftwareGenre(int id) {
     return kSoftware.count(id) != 0;
 }
 
+// Whether the store's answer describes a game: the type must be "game" and no software genre may be set.
+bool IsGameJson(const std::string& json) {
+    if (json.find("\"success\":true") == std::string::npos) return true;  // unknown apps stay in the list
+    bool isGame = true;
+    size_t type = json.find("\"type\":\"");
+    if (type != std::string::npos) isGame = json.compare(type + 8, 4, "game") == 0;
+    size_t genres = json.find("\"genres\":[");
+    if (genres != std::string::npos) {
+        size_t end = json.find(']', genres);
+        for (size_t pos = genres; (pos = json.find("\"id\":\"", pos)) != std::string::npos && pos < end; pos += 6)
+            if (IsSoftwareGenre(atoi(json.c_str() + pos + 6))) isGame = false;
+    }
+    return isGame;
+}
+
+std::wstring Utf8ToWide(const std::string& bytes) {
+    if (bytes.empty()) return {};
+    int size = MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+    std::wstring result(size, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), result.data(), size);
+    return result;
+}
+
 // Asks the store whether an app is a game. Failed requests are not cached, so they are retried next start.
 void ClassifyApp(const std::wstring& appId) {
     Sleep(300);  // stay well below the store API's rate limit
     std::string json = StoreDetails(appId, L"basic,genres");
     if (json.empty()) return;
+    PostMessageW(g_mainWnd, WM_CLASSIFIED, (WPARAM)wcstoull(appId.c_str(), nullptr, 10), IsGameJson(json) ? 1 : 0);
+}
 
-    bool isGame = true;
-    if (json.find("\"success\":true") != std::string::npos) {
-        size_t type = json.find("\"type\":\"");
-        if (type != std::string::npos) isGame = json.compare(type + 8, 4, "game") == 0;
-        size_t genres = json.find("\"genres\":[");
-        if (genres != std::string::npos) {
-            size_t end = json.find(']', genres);
-            for (size_t pos = genres; (pos = json.find("\"id\":\"", pos)) != std::string::npos && pos < end; pos += 6)
-                if (IsSoftwareGenre(atoi(json.c_str() + pos + 6))) isGame = false;
-        }
+struct OwnedResult {
+    std::wstring appId, name;
+    bool isGame = false;
+};
+
+// Looks up an app the account owns but has not installed: its name, and whether it is a game at all.
+void ResolveOwnedApp(const std::wstring& appId) {
+    Sleep(300);
+    std::string json = StoreDetails(appId, L"basic,genres");
+    if (json.empty()) return;
+
+    auto* result = new OwnedResult;
+    result->appId = appId;
+    result->isGame = json.find("\"success\":true") != std::string::npos && IsGameJson(json);
+    size_t type = json.find("\"type\":\"");
+    size_t name = type == std::string::npos ? std::string::npos : json.find("\"name\":\"", type);
+    if (result->isGame && name != std::string::npos) {
+        size_t start = name + 8, end = start;
+        while (end < json.size() && json[end] != '"') end += json[end] == '\\' ? 2 : 1;
+        result->name = ReadJsonString(Utf8ToWide(json.substr(start, end - start)), 0);
     }
-    PostMessageW(g_mainWnd, WM_CLASSIFIED, (WPARAM)wcstoull(appId.c_str(), nullptr, 10), isGame ? 1 : 0);
+    if (result->name.empty()) result->isGame = false;
+    PostMessageW(g_mainWnd, WM_OWNED, 0, (LPARAM)result);
 }
 
 WorkQueue g_coverQueue(DownloadCover);
 WorkQueue g_classifyQueue(ClassifyApp);
+WorkQueue g_ownedQueue(ResolveOwnedApp);
 
 void QueueBackgroundWork() {
-    std::vector<std::wstring> covers, unknown;
+    std::vector<std::wstring> covers, unknown, owned;
+    std::set<std::wstring> known;
     for (const auto& game : g_games) {
+        known.insert(game.appId);
         std::error_code ec;
         if (!fs::exists(CoverPath(game.appId), ec) || !fs::exists(PortraitPath(game.appId), ec))
             covers.push_back(game.appId);
         if (!g_isGame.count(game.appId)) unknown.push_back(game.appId);
     }
+    for (const auto& id : FindOwnedCandidates()) {
+        auto verdict = g_isGame.find(id);
+        if (!known.count(id) && !g_ownedNames.count(id) && (verdict == g_isGame.end() || verdict->second)) owned.push_back(id);
+    }
     if (!covers.empty()) g_coverQueue.Push(covers);
     if (!unknown.empty()) g_classifyQueue.Push(unknown);
+    if (!owned.empty()) g_ownedQueue.Push(owned);
 }
 
 // ============================================================================ UI
@@ -667,16 +804,20 @@ constexpr float kMinClientWidth = 830, kMinClientHeight = 520;
 constexpr float kStartClientWidth = 1120, kStartClientHeight = 680;
 
 constexpr int ID_RENAME_EDIT = 2002;
+constexpr int ID_SEARCH_EDIT = 2003;
 constexpr int ID_ACTION = 3000;  // + button index
 constexpr UINT_PTR TIMER_ANIMATION = 1;
-constexpr DWORD WINDOW_STYLE = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+// A popup window with a resizable frame and no caption: it draws its own title bar. (An overlapped window would get
+// a caption from the system whether it asks for one or not.)
+constexpr DWORD FRAME_STYLE = WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+constexpr DWORD WINDOW_STYLE = WS_POPUP | FRAME_STYLE | WS_CLIPCHILDREN;
 
 // A main panel at least this wide switches from a list to a grid of cards.
-constexpr float kGridMinWidth = 820, kCardPad = 12, kCardGap = 8, kCardTargetWidth = 200, kCardTextHeight = 58;
+constexpr float kGridMinWidth = 820, kCardPad = 12, kCardGap = 8, kCardTargetWidth = 200, kCardTextHeight = 74;
 
 
 enum { BTN_SCAN, BTN_IMPORT, BTN_RANDOM, BTN_COUNT };
-enum class Icon { None, Refresh, Download, Plus, Library, Folder, Sort };
+enum class Icon { None, Refresh, Download, Plus, Library, Folder, Sort, Search };
 const wchar_t* const kButtonLabels[BTN_COUNT] = { L"Neu scannen", L"Kategorien aus Steam", L"Zufällig auswählen" };
 const Icon kButtonIcons[BTN_COUNT] = { Icon::Refresh, Icon::Download, Icon::None };
 const float kButtonWidths[BTN_COUNT - 1] = { 140, 200 };
@@ -704,7 +845,10 @@ struct Layout {
     RECT btn[BTN_COUNT]{};
     RECT sidebar{}, main{}, sideList{}, create{};  // create: "+ Erstellen" in the sidebar header
     RECT topBar{};
-    RECT sortBtn{};                             // "Sortieren" at the top right of the main panel
+    RECT search{}, searchClear{};  // the search field in the top bar and its "x"
+    RECT caption[3]{};             // minimize, maximize and close buttons at the top right
+    RECT sortBtn{};                          // "Sortieren" at the top right of the main panel
+    RECT toggle{};                           // switch for the games that are not installed, left of it
     std::vector<RECT> chips;  // one row of the sidebar per category
     int rowH = 0;  // vertical step between rows of items (list rows or card rows)
     int wheelStep = 0;
@@ -718,7 +862,11 @@ struct Hover {
     int menuItem = -1;
     bool sideCreate = false;
     bool sortBtn = false;
-    bool Any() const { return row >= 0 || button >= 0 || chip >= 0 || menuItem >= 0 || sideCreate || sortBtn; }
+    bool searchClear = false;
+    bool toggle = false;
+    bool Any() const {
+        return row >= 0 || button >= 0 || chip >= 0 || menuItem >= 0 || sideCreate || sortBtn || searchClear || toggle;
+    }
 };
 
 // Context menu, opened with the right mouse button on a category row or on a game.
@@ -772,9 +920,12 @@ bool g_importReady = false;
 Menu g_menu;
 int g_renameChip = -1;   // category chip being edited in place
 HWND g_renameEdit = nullptr;
+HWND g_searchEdit = nullptr;
+std::wstring g_search;    // what the search field currently holds
 bool g_scanReady = false;
 bool g_tracking = false;
 bool g_fullscreen = false;
+int g_captionHover = -1, g_captionPressed = -1;  // minimize, maximize, close
 HFONT g_editFont = nullptr;
 HBRUSH g_editBrush = nullptr;
 std::vector<int> g_visible;  // indices into g_games for the current category
@@ -825,12 +976,23 @@ void Redraw(HWND hwnd) { InvalidateRect(hwnd, nullptr, FALSE); }
 
 void LayoutToast(HWND hwnd);
 
+// Case-insensitive "contains", for the search field.
+bool NameContains(const std::wstring& name, const std::wstring& needle) {
+    auto lower = [](std::wstring text) {
+        if (!text.empty()) CharLowerBuffW(text.data(), (DWORD)text.size());
+        return text;
+    };
+    return lower(name).find(lower(needle)) != std::wstring::npos;
+}
+
 void RefreshGames() {
     const std::wstring& filter = SelectedCategory();
     g_visible.clear();
     bool selectionVisible = false;
     for (int i = 0; i < (int)g_games.size(); ++i) {
         if (filter != kAllGames && !g_games[i].InCategory(filter)) continue;
+        if (!g_showUninstalled && !g_games[i].installed) continue;
+        if (!g_search.empty() && !NameContains(g_games[i].name, g_search)) continue;
         g_visible.push_back(i);
         selectionVisible |= i == g_sel;
     }
@@ -863,6 +1025,20 @@ void Relayout(HWND hwnd) {
     g_L.bar = { 0, panelBottom, W, H };
     int top = S(kTopBar);
     g_L.topBar = { 0, 0, W, top };
+    int captionW = S(46), captionH = S(32);
+    for (int i = 0; i < 3; ++i)
+        g_L.caption[i] = { W - (3 - i) * captionW, 0, W - (2 - i) * captionW, captionH };
+    // The search field sits in the middle of the top bar, like Spotify's.
+    int searchW = std::clamp(W - 2 * S(300), S(220), S(520)), searchH = S(44), searchTop = (top - searchH) / 2;
+    g_L.search = { (W - searchW) / 2, searchTop, (W + searchW) / 2, searchTop + searchH };
+    int clearSize = S(28);
+    g_L.searchClear = { g_L.search.right - S(10) - clearSize, searchTop + (searchH - clearSize) / 2,
+        g_L.search.right - S(10), searchTop + (searchH - clearSize) / 2 + clearSize };
+    if (g_searchEdit) {
+        int eh = S(18), left = g_L.search.left + S(48);
+        SetWindowPos(g_searchEdit, nullptr, left, searchTop + (searchH - eh) / 2,
+            g_L.searchClear.left - S(6) - left, eh, SWP_NOZORDER);
+    }
     g_L.sidebar = { gap, top, gap + S(kSidebarWidth), std::max(top + S(100), panelBottom - S(4)) };
     g_L.main = { g_L.sidebar.right + gap, top, W - gap, g_L.sidebar.bottom };
     g_L.sideList = { g_L.sidebar.left, g_L.sidebar.top + S(kSideHeader), g_L.sidebar.right, g_L.sidebar.bottom - S(8) };
@@ -872,6 +1048,9 @@ void Relayout(HWND hwnd) {
     int sortW = S(200), sortH = S(34);
     g_L.sortBtn = { g_L.main.right - S(kMargin) - sortW, g_L.main.top + S(24), g_L.main.right - S(kMargin),
         g_L.main.top + S(24) + sortH };
+    // In a narrow panel the switch loses its label to leave room for the category title.
+    int toggleW = g_L.main.right - g_L.main.left < S(760) ? S(48) : S(176);
+    g_L.toggle = { g_L.sortBtn.left - S(16) - toggleW, g_L.sortBtn.top, g_L.sortBtn.left - S(16), g_L.sortBtn.bottom };
     int listTop = g_L.main.top + S(kMainHeader);
     g_L.list = { g_L.main.left, listTop, g_L.main.right, std::max(listTop, (int)g_L.main.bottom - S(8)) };
 
@@ -966,6 +1145,7 @@ Bitmap* GetPortrait(const std::wstring& appId) { return g_portraits.Get(appId, P
 struct BakedArt {
     int w = 0, h = 0;
     Bitmap* bitmap = nullptr;
+    bool gray = false;
 };
 using BakedCache = std::map<unsigned long long, BakedArt>;
 BakedCache g_bakedRows, g_bakedCards, g_bakedTilesSmall, g_bakedTilesFull;
@@ -1039,8 +1219,9 @@ const Font& CachedFont(REAL px, bool bold) {
     return *font;
 }
 
-// Scales `source` to w x h with rounded corners; `crop` fills the box with the middle of the image.
-Bitmap* BakeArt(Bitmap* source, int w, int h, REAL radius, bool crop) {
+// Scales `source` to w x h with rounded corners; `crop` fills the box with the middle of the image and `gray`
+// turns it into a dimmed black and white version, the look of games that are not installed.
+Bitmap* BakeArt(Bitmap* source, int w, int h, REAL radius, bool crop, bool gray = false) {
     Bitmap* baked = new Bitmap(w, h, PixelFormat32bppPARGB);
     Graphics g(baked);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
@@ -1049,21 +1230,33 @@ Bitmap* BakeArt(Bitmap* source, int w, int h, REAL radius, bool crop) {
     GraphicsPath clip;
     RoundPath(clip, RectF(0, 0, (REAL)w, (REAL)h), radius);
     g.SetClip(&clip);
-    RectF dest(0, 0, (REAL)w, (REAL)h);
-    if (crop) {
-        REAL sourceH = (REAL)source->GetHeight(), sourceW = sourceH * w / h;
-        g.DrawImage(source, dest, ((REAL)source->GetWidth() - sourceW) / 2, 0, sourceW, sourceH, UnitPixel);
-    } else {
-        g.DrawImage(source, dest);
+
+    ImageAttributes attributes;
+    if (gray) {
+        const REAL r = 0.30f * 0.8f, gr = 0.59f * 0.8f, b = 0.11f * 0.8f;  // luminance, a bit darker
+        ColorMatrix matrix = { r, r, r, 0, 0,
+                               gr, gr, gr, 0, 0,
+                               b, b, b, 0, 0,
+                               0, 0, 0, 1, 0,
+                               0, 0, 0, 0, 1 };
+        attributes.SetColorMatrix(&matrix, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);
     }
+    RectF dest(0, 0, (REAL)w, (REAL)h);
+    REAL sourceW = (REAL)source->GetWidth(), sourceH = (REAL)source->GetHeight(), sourceX = 0;
+    if (crop) {
+        sourceW = sourceH * w / h;
+        sourceX = ((REAL)source->GetWidth() - sourceW) / 2;
+    }
+    g.DrawImage(source, dest, sourceX, 0, sourceW, sourceH, UnitPixel, &attributes);
     return baked;
 }
 
-Bitmap* GetBaked(BakedCache& cache, const std::wstring& appId, Bitmap* source, int w, int h, REAL radius, bool crop) {
+Bitmap* GetBaked(BakedCache& cache, const std::wstring& appId, Bitmap* source, int w, int h, REAL radius, bool crop,
+    bool gray = false) {
     BakedArt& entry = cache[wcstoull(appId.c_str(), nullptr, 10)];
-    if (!entry.bitmap || entry.w != w || entry.h != h) {
+    if (!entry.bitmap || entry.w != w || entry.h != h || entry.gray != gray) {
         delete entry.bitmap;
-        entry = { w, h, BakeArt(source, w, h, radius, crop) };
+        entry = { w, h, BakeArt(source, w, h, radius, crop, gray), gray };
     }
     return entry.bitmap;
 }
@@ -1158,7 +1351,7 @@ RECT PlayRect(int i) {
 }
 
 bool InPlayZone(int i, POINT p) {
-    if (i < 0) return false;
+    if (i < 0 || !g_games[g_visible[i]].installed) return false;  // games that are not installed cannot be started
     RECT r = PlayRect(i);
     return In(r, p);
 }
@@ -1225,15 +1418,25 @@ PlayParts PlayStats(const Game& game) {
 // "36 Std. · Zuletzt gespielt vor 3 Tagen · 54 GB", for the one-line list rows
 std::wstring PlayInfo(const Game& game) {
     PlayParts parts = PlayStats(game);
-    std::wstring text = parts.playtime;
+    std::wstring text = game.installed ? parts.playtime : L"Nicht installiert";
     auto append = [&](const std::wstring& part) {
         if (part.empty()) return;
         text += text.empty() ? L"" : L"  ·  ";
         text += part;
     };
+    if (!game.installed && parts.played) append(parts.playtime);
     if (!parts.when.empty()) append(L"Zuletzt gespielt " + parts.when);
     append(parts.size);
     return text;
+}
+
+// A thin bar: the share of achievements that is unlocked. A finished game gets the lighter accent.
+void DrawProgress(Graphics& g, RectF bar, int done, int total) {
+    FillRound(g, bar, bar.Height / 2, kSurface);
+    if (done <= 0 || total <= 0) return;
+    REAL share = std::min(1.0f, (REAL)done / (REAL)total);
+    FillRound(g, RectF(bar.X, bar.Y, std::max(bar.Height, bar.Width * share), bar.Height), bar.Height / 2,
+        done >= total ? kAccentHover : kAccent);
 }
 
 void DrawRow(Graphics& g, int visibleIndex, int W) {
@@ -1255,7 +1458,7 @@ void DrawRow(Graphics& g, int visibleIndex, int W) {
     GraphicsPath clip;
     RoundPath(clip, cover, (REAL)S(5));
     if (Bitmap* bitmap = GetCover(game.appId)) {
-        Bitmap* baked = GetBaked(g_bakedRows, game.appId, bitmap, (int)cover.Width, (int)cover.Height, (REAL)S(5), false);
+        Bitmap* baked = GetBaked(g_bakedRows, game.appId, bitmap, (int)cover.Width, (int)cover.Height, (REAL)S(5), false, !game.installed);
         g.DrawImage(baked, Rect((int)cover.X, (int)cover.Y, (int)cover.Width, (int)cover.Height));
     } else {
         SolidBrush brush(kCover);
@@ -1263,7 +1466,7 @@ void DrawRow(Graphics& g, int visibleIndex, int W) {
         DrawCentered(g, game.name.substr(0, 1), (REAL)S(18), true, kAccentHover, cover);
     }
 
-    if (hover && !g_drag.active) {
+    if (hover && !g_drag.active && game.installed) {
         SolidBrush dim(Color(110, 0, 0, 0));
         g.FillPath(&dim, &clip);
         REAL diameter = (REAL)S(30), cx = cover.X + cover.Width / 2, cy = cover.Y + cover.Height / 2;
@@ -1274,7 +1477,15 @@ void DrawRow(Graphics& g, int visibleIndex, int W) {
     }
 
     REAL tx = cover.GetRight() + S(16), tw = slot.GetRight() - tx - S(16);
-    DrawLabel(g, game.name, (REAL)S(15), true, selected ? kAccentHover : kText, RectF(tx, slot.Y + S(10), tw, (REAL)S(22)));
+    if (game.achTotal > 0) {  // achievement progress on the right of the row
+        REAL barW = (REAL)S(150), barX = slot.GetRight() - S(16) - barW;
+        DrawLabel(g, std::to_wstring(game.achDone) + L" / " + std::to_wstring(game.achTotal) + L" Erfolge", (REAL)S(12), false,
+            kText2, RectF(barX, slot.Y + S(12), barW, (REAL)S(18)), StringAlignmentFar);
+        DrawProgress(g, RectF(barX, slot.Y + S(36), barW, (REAL)S(6)), game.achDone, game.achTotal);
+        tw -= barW + S(24);
+    }
+    DrawLabel(g, game.name, (REAL)S(15), true, selected ? kAccentHover : (game.installed ? kText : kText2),
+        RectF(tx, slot.Y + S(10), tw, (REAL)S(22)));
     DrawLabel(g, PlayInfo(game), (REAL)S(13), false, kText2, RectF(tx, slot.Y + S(32), tw, (REAL)S(18)));
 }
 
@@ -1294,7 +1505,7 @@ void DrawCard(Graphics& g, int visibleIndex) {
     Bitmap* portrait = GetPortrait(game.appId);
     Bitmap* source = portrait ? portrait : GetCover(game.appId);  // without portrait art, use the middle of the header
     if (source) {
-        Bitmap* baked = GetBaked(g_bakedCards, game.appId, source, g_L.artW, g_L.artH, (REAL)S(6), portrait == nullptr);
+        Bitmap* baked = GetBaked(g_bakedCards, game.appId, source, g_L.artW, g_L.artH, (REAL)S(6), portrait == nullptr, !game.installed);
         g.DrawImage(baked, Rect((int)art.X, (int)art.Y, g_L.artW, g_L.artH));
     } else {
         SolidBrush brush(kCover);
@@ -1302,7 +1513,7 @@ void DrawCard(Graphics& g, int visibleIndex) {
         DrawCentered(g, game.name.substr(0, 1), (REAL)S(40), true, kAccentHover, art);
     }
 
-    if (hover || selected) {
+    if ((hover || selected) && game.installed) {
         RectF play = RF(PlayRect(visibleIndex));
         bool hot = hover && g_hover.cover;
         REAL grow = hot ? (REAL)S(3) : 0.0f;
@@ -1315,11 +1526,15 @@ void DrawCard(Graphics& g, int visibleIndex) {
     }
 
     REAL textTop = art.GetBottom() + S(10);
-    DrawLabel(g, game.name, (REAL)S(15), true, selected ? kAccentHover : kText, RectF(art.X, textTop, art.Width, (REAL)S(20)));
+    DrawLabel(g, game.name, (REAL)S(15), true, selected ? kAccentHover : (game.installed ? kText : kText2),
+        RectF(art.X, textTop, art.Width, (REAL)S(20)));
     // Play time (with the size next to it) and last played on their own lines.
     PlayParts stats = PlayStats(game);
     std::wstring first = stats.playtime, second;
-    if (stats.played) {
+    if (!game.installed) {
+        first = L"Nicht installiert";
+        if (stats.played) second = stats.playtime;
+    } else if (stats.played) {
         if (!stats.size.empty()) first += L"  ·  " + stats.size;
         second = L"Zuletzt " + stats.when;
     } else {
@@ -1328,6 +1543,12 @@ void DrawCard(Graphics& g, int visibleIndex) {
     DrawLabel(g, first, (REAL)S(13), false, kText2, RectF(art.X, textTop + S(22), art.Width, (REAL)S(17)));
     if (!second.empty())
         DrawLabel(g, second, (REAL)S(13), false, kText2, RectF(art.X, textTop + S(39), art.Width, (REAL)S(17)));
+    if (game.achTotal > 0) {  // achievement progress as a bar with the count next to it
+        REAL labelW = (REAL)S(44), barY = textTop + S(62);
+        DrawProgress(g, RectF(art.X, barY, art.Width - labelW - S(8), (REAL)S(6)), game.achDone, game.achTotal);
+        DrawLabel(g, std::to_wstring(game.achDone) + L"/" + std::to_wstring(game.achTotal), (REAL)S(12), false, kText2,
+            RectF(art.GetRight() - labelW, barY - S(6), labelW, (REAL)S(18)), StringAlignmentFar, StringAlignmentCenter);
+    }
 }
 
 // ---------------------------------------------------------------- frame
@@ -1337,9 +1558,11 @@ void DrawList(Graphics& g, int W) {
     GraphicsState clipState = g.Save();
     g.SetClip(listRect, CombineModeIntersect);
     if (g_visible.empty()) {
-        DrawLabel(g, L"Hier ist noch nichts", (REAL)S(18), true, kText,
+        bool searching = !g_search.empty();
+        DrawLabel(g, searching ? L"Keine Treffer für „" + g_search + L"“" : L"Hier ist noch nichts", (REAL)S(18), true, kText,
             RectF(listRect.X, listRect.Y + S(40), listRect.Width, (REAL)S(26)), StringAlignmentCenter);
-        DrawLabel(g, L"Wähle eine andere Kategorie oder scanne Steam neu.", (REAL)S(13), false, kText2,
+        DrawLabel(g, searching ? L"Prüfe die Schreibweise oder lösche die Suche."
+                               : L"Wähle eine andere Kategorie oder scanne Steam neu.", (REAL)S(13), false, kText2,
             RectF(listRect.X, listRect.Y + S(70), listRect.Width, (REAL)S(20)), StringAlignmentCenter);
     } else {
         for (int i = (g_scroll / g_L.rowH) * g_L.cols; i < (int)g_visible.size() && ItemTop(i) < g_L.list.bottom; ++i) {
@@ -1383,6 +1606,12 @@ void DrawIcon(Graphics& g, Icon icon, REAL cx, REAL cy, REAL size, const Color& 
         g.DrawLine(&pen, cx - h * 0.7f, cy, cx + h * 0.7f, cy);
         g.DrawLine(&pen, cx, cy - h * 0.7f, cx, cy + h * 0.7f);
         break;
+    case Icon::Search: {  // a magnifying glass
+        REAL r = h * 0.6f;
+        g.DrawEllipse(&pen, cx - h * 0.2f - r, cy - h * 0.2f - r, 2 * r, 2 * r);
+        g.DrawLine(&pen, cx - h * 0.2f + r * 0.72f, cy - h * 0.2f + r * 0.72f, cx + h * 0.85f, cy + h * 0.85f);
+        break;
+    }
     case Icon::Sort:  // three bars that get shorter
         g.DrawLine(&pen, cx - h * 0.85f, cy - h * 0.6f, cx + h * 0.85f, cy - h * 0.6f);
         g.DrawLine(&pen, cx - h * 0.85f, cy, cx + h * 0.4f, cy);
@@ -1459,7 +1688,7 @@ void DrawCategoryTile(Graphics& g, int category, RectF tile) {
             if (!header) continue;
             BakedCache& cache = cells == 1 ? g_bakedTilesFull : g_bakedTilesSmall;
             int size = (int)cell;
-            Bitmap* baked = GetBaked(cache, games[i]->appId, header, size, size, 1.0f, true);
+            Bitmap* baked = GetBaked(cache, games[i]->appId, header, size, size, 1.0f, true, !games[i]->installed);
             g.DrawImage(baked, Rect((int)(tile.X + (i % cells) * cell), (int)(tile.Y + (i / cells) * cell), size, size));
         }
     }
@@ -1551,6 +1780,21 @@ void SelectSort(HWND hwnd, SortKey key) {
     RefreshGames();
     SaveSettings();
     Redraw(hwnd);
+}
+
+// Switch that shows or hides the games that are not installed.
+void DrawUninstalledToggle(Graphics& g) {
+    RectF r = RF(g_L.toggle);
+    bool on = g_showUninstalled, hover = g_hover.toggle;
+    REAL trackW = (REAL)S(38), trackH = (REAL)S(22);
+    RectF track(r.GetRight() - trackW, r.Y + (r.Height - trackH) / 2, trackW, trackH);
+    FillRound(g, track, trackH / 2, on ? (hover ? kAccentHover : kAccent) : (hover ? Color(255, 110, 110, 110) : Color(255, 84, 84, 84)));
+    REAL knob = trackH - S(6);
+    SolidBrush brush(Color(255, 255, 255, 255));
+    g.FillEllipse(&brush, on ? track.GetRight() - knob - S(3) : track.X + S(3), track.Y + (trackH - knob) / 2, knob, knob);
+    if (r.Width > S(80))
+        DrawLabel(g, L"Nicht installierte", (REAL)S(13), true, hover ? kText : kText2,
+            RectF(r.X, r.Y, r.Width - trackW - S(10), r.Height), StringAlignmentFar, StringAlignmentCenter);
 }
 
 void DrawSortButton(Graphics& g) {
@@ -1673,8 +1917,64 @@ void DrawTopBar(Graphics& g) {
 
     REAL tx = circle.GetRight() + S(12), tw = (REAL)S(kSidebarWidth) - S(avatar / g_scale + 12);
     DrawLabel(g, name, (REAL)S(16), true, kText, RectF(tx, cy - S(20), tw + S(200), (REAL)S(22)));
-    DrawLabel(g, std::to_wstring(g_games.size()) + (g_games.size() == 1 ? L" Spiel installiert" : L" Spiele installiert"),
+    size_t installedCount = std::count_if(g_games.begin(), g_games.end(), [](const Game& game) { return game.installed; });
+    DrawLabel(g, std::to_wstring(installedCount) + (installedCount == 1 ? L" Spiel installiert" : L" Spiele installiert"),
         (REAL)S(13), false, kText2, RectF(tx, cy + S(1), tw + S(200), (REAL)S(18)));
+}
+
+int CaptionButtonAt(POINT p) {
+    for (int i = 0; i < 3; ++i)
+        if (In(g_L.caption[i], p)) return i;
+    return -1;
+}
+
+// Minimize, maximize (or restore) and close, drawn like Windows' own buttons.
+void DrawCaptionButtons(Graphics& g) {
+    if (g_fullscreen) return;
+    bool zoomed = IsZoomed(g_mainWnd) != 0;
+    for (int i = 0; i < 3; ++i) {
+        RectF r = RF(g_L.caption[i]);
+        bool hover = i == g_captionHover;
+        if (hover) {
+            SolidBrush brush(i == 2 ? Color(255, 232, 17, 35) : kSurface);
+            g.FillRectangle(&brush, r);
+        }
+        Pen pen(kText, 1.0f);
+        REAL cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2, d = (REAL)S(5);
+        if (i == 0) {
+            g.DrawLine(&pen, cx - d, cy, cx + d, cy);
+        } else if (i == 1) {
+            if (zoomed) {  // two overlapping squares
+                g.DrawRectangle(&pen, cx - d, cy - d + S(2), 2 * d - S(2), 2 * d - S(2));
+                g.DrawLine(&pen, cx - d + S(2), cy - d + 1, cx + d, cy - d + 1);
+                g.DrawLine(&pen, cx + d, cy - d + 1, cx + d, cy + d - S(2));
+            } else {
+                g.DrawRectangle(&pen, cx - d, cy - d, 2 * d, 2 * d);
+            }
+        } else {
+            g.DrawLine(&pen, cx - d, cy - d, cx + d, cy + d);
+            g.DrawLine(&pen, cx - d, cy + d, cx + d, cy - d);
+        }
+    }
+}
+
+// Search field: dark pill with a magnifying glass, a white ring while it has focus, and an "x" to clear it.
+void DrawSearchField(Graphics& g) {
+    RectF pill = RF(g_L.search);
+    bool focus = GetFocus() == g_searchEdit;
+    FillRound(g, pill, pill.Height / 2, kField);
+    if (focus) StrokePill(g, pill, kText, 2.0f);
+    DrawIcon(g, Icon::Search, pill.X + S(26), pill.Y + pill.Height / 2, (REAL)S(18), focus ? kText : kText2);
+    if (!g_search.empty()) {
+        RectF clear = RF(g_L.searchClear);
+        REAL cx = clear.X + clear.Width / 2, cy = clear.Y + clear.Height / 2, d = (REAL)S(5);
+        if (g_hover.searchClear) FillRound(g, clear, clear.Height / 2, kSurface);
+        Pen pen(g_hover.searchClear ? kText : kText2, (REAL)S(1.8f));
+        pen.SetStartCap(LineCapRound);
+        pen.SetEndCap(LineCapRound);
+        g.DrawLine(&pen, cx - d, cy - d, cx + d, cy + d);
+        g.DrawLine(&pen, cx - d, cy + d, cx + d, cy - d);
+    }
 }
 
 void DrawUi(Graphics& g, int W, int H) {
@@ -1683,14 +1983,17 @@ void DrawUi(Graphics& g, int W, int H) {
     FillRound(g, RF(g_L.main), (REAL)S(8), kBg);
 
     DrawTopBar(g);
+    DrawSearchField(g);
+    DrawCaptionButtons(g);
 
     // The main panel is titled with the category that is open.
     RectF header((REAL)(g_L.main.left + S(kMargin)), (REAL)g_L.main.top, (REAL)(g_L.main.right - g_L.main.left - 2 * S(kMargin)), 0);
     DrawLabel(g, SelectedCategory(), (REAL)S(32), true, kText,
-        RectF(header.X, header.Y + S(18), header.Width - S(220), (REAL)S(46)));
+        RectF(header.X, header.Y + S(18), (REAL)(g_L.toggle.left - S(24) - (int)header.X), (REAL)S(46)));
 
     DrawSidebar(g);
     DrawSortButton(g);
+    DrawUninstalledToggle(g);
     DrawList(g, W);
     DrawBar(g, W, H);
     DrawToast(g);
@@ -1771,6 +2074,8 @@ void UpdateHover(HWND hwnd, POINT p) {
     next.cover = InPlayZone(next.row, p);
     next.sideCreate = In(g_L.create, p);
     next.sortBtn = In(g_L.sortBtn, p);
+    next.searchClear = !g_search.empty() && In(g_L.searchClear, p);
+    next.toggle = In(g_L.toggle, p);
     if (g_menu.open) {
         // The menu sits on top, so it hides whatever is underneath.
         next = Hover{};
@@ -1779,7 +2084,8 @@ void UpdateHover(HWND hwnd, POINT p) {
     }
     bool changed = next.row != g_hover.row || next.button != g_hover.button || next.chip != g_hover.chip ||
         next.cover != g_hover.cover || next.menuItem != g_hover.menuItem || next.sideCreate != g_hover.sideCreate ||
-        next.sortBtn != g_hover.sortBtn;
+        next.sortBtn != g_hover.sortBtn || next.searchClear != g_hover.searchClear ||
+        next.toggle != g_hover.toggle;
     if (!changed) return;
 
     // Repaint only what changed: the cards that lose and gain the highlight, the buttons, the chips.
@@ -1798,6 +2104,8 @@ void UpdateHover(HWND hwnd, POINT p) {
         if (chip >= 0 && chip < (int)g_L.chips.size()) touch(g_L.chips[chip], S(2));
     if (previous.sideCreate != next.sideCreate) touch(g_L.create, S(2));
     if (previous.sortBtn != next.sortBtn) touch(g_L.sortBtn, S(2));
+    if (previous.searchClear != next.searchClear) touch(g_L.searchClear, S(2));
+    if (previous.toggle != next.toggle) touch(g_L.toggle, S(2));
 }
 
 void EnsureVisible(int visibleIndex) {
@@ -1933,6 +2241,7 @@ void DeleteCategory(HWND hwnd, int index) {
 }
 
 void LaunchGame(HWND hwnd, const Game& game) {
+    if (!game.installed) return;
     std::wstring uri = L"steam://rungameid/" + game.appId;
     HINSTANCE result = ShellExecuteW(hwnd, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     if ((INT_PTR)result <= 32)
@@ -1954,10 +2263,18 @@ void SelectRandomGame(HWND hwnd) {
         ShowToast(hwnd, L"In dieser Kategorie sind keine Spiele");
         return;
     }
-    std::vector<int> choices;
-    for (int i = 0; i < (int)g_visible.size(); ++i)
+    // Only installed games can be played, so only they are picked.
+    std::vector<int> choices, installed;
+    for (int i = 0; i < (int)g_visible.size(); ++i) {
+        if (!g_games[g_visible[i]].installed) continue;
+        installed.push_back(i);
         if (g_visible[i] != g_sel) choices.push_back(i);
-    if (choices.empty()) choices.push_back(0);
+    }
+    if (installed.empty()) {
+        ShowToast(hwnd, L"In dieser Kategorie ist kein Spiel installiert");
+        return;
+    }
+    if (choices.empty()) choices = installed;
 
     std::random_device rd;
     std::mt19937 rng(rd());
@@ -2035,6 +2352,33 @@ void OnScanDone(HWND hwnd, std::map<std::wstring, Game>* found) {
     g_scanReady = true;
 }
 
+// An owned game that is not installed has been looked up: add it to the library.
+void OnOwned(HWND hwnd, OwnedResult* raw) {
+    std::unique_ptr<OwnedResult> result(raw);
+    g_isGame[result->appId] = result->isGame;
+    SaveTypes();
+    if (!result->isGame) return;
+    g_ownedNames[result->appId] = result->name;
+    SaveOwned();
+
+    std::wstring selected = g_sel >= 0 && g_sel < (int)g_games.size() ? g_games[g_sel].appId : L"";
+    Game game;
+    game.appId = result->appId;
+    game.name = result->name;
+    game.installed = false;
+    g_games.push_back(game);
+    std::sort(g_games.begin(), g_games.end(), [](const Game& a, const Game& b) {
+        return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
+    });
+    ApplyPlayStats(result->appId);
+    g_sel = -1;  // indices moved; the selection is looked up again by app id
+    for (int i = 0; i < (int)g_games.size(); ++i)
+        if (!selected.empty() && g_games[i].appId == selected) g_sel = i;
+    g_coverQueue.Push({ result->appId });
+    RefreshGames();
+    Relayout(hwnd);
+}
+
 void OnClassified(HWND hwnd, const std::wstring& appId, bool isGame) {
     g_isGame[appId] = isGame;
     SaveTypes();
@@ -2075,7 +2419,7 @@ void ToggleFullscreen(HWND hwnd) {
         MONITORINFO monitor{ sizeof(monitor) };
         if (!GetWindowPlacement(hwnd, &previous) || !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor))
             return;
-        SetWindowLongPtrW(hwnd, GWL_STYLE, (WINDOW_STYLE & ~WS_OVERLAPPEDWINDOW) | WS_VISIBLE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WINDOW_STYLE & ~FRAME_STYLE) | WS_VISIBLE);
         SetWindowPos(hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
             monitor.rcMonitor.right - monitor.rcMonitor.left, monitor.rcMonitor.bottom - monitor.rcMonitor.top,
             SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
@@ -2098,11 +2442,42 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
+// The games shown follow what the search field holds.
+void ApplySearch(HWND hwnd) {
+    int length = GetWindowTextLengthW(g_searchEdit);
+    std::wstring text(length + 1, L'\0');
+    GetWindowTextW(g_searchEdit, text.data(), length + 1);
+    text.resize(length);
+    g_search = text;
+    g_scroll = 0;
+    RefreshGames();
+    Redraw(hwnd);
+}
+
+LRESULT CALLBACK SearchEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_KEYDOWN && wp == VK_F11) { ToggleFullscreen(GetParent(hwnd)); return 0; }
+    if (msg == WM_CHAR && wp == VK_ESCAPE) {
+        SetWindowTextW(hwnd, L"");  // Esc empties the field and gives the focus back
+        SetFocus(GetParent(hwnd));
+        return 0;
+    }
+    if (msg == WM_CHAR && wp == VK_RETURN) { SetFocus(GetParent(hwnd)); return 0; }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
 POINT ClientPoint(LPARAM lp) { return { (short)LOWORD(lp), (short)HIWORD(lp) }; }
 
 void OnMouseDown(HWND hwnd, UINT msg, LPARAM lp) {
     SetFocus(hwnd);
     POINT p = ClientPoint(lp);
+    if (!g_search.empty() && In(g_L.searchClear, p)) {
+        SetWindowTextW(g_searchEdit, L"");
+        return;
+    }
+    if (In(g_L.search, p)) {
+        SetFocus(g_searchEdit);  // the whole field is clickable
+        return;
+    }
     if (g_menu.open) {
         // The menu swallows the click: pick an item, or just close it.
         Menu menu = g_menu;
@@ -2124,6 +2499,14 @@ void OnMouseDown(HWND hwnd, UINT msg, LPARAM lp) {
     }
     if (In(g_L.create, p)) {
         CreateCategoryRow(hwnd);
+        return;
+    }
+    if (In(g_L.toggle, p)) {
+        g_showUninstalled = !g_showUninstalled;
+        g_scroll = 0;
+        RefreshGames();
+        SaveSettings();
+        Redraw(hwnd);
         return;
     }
     if (In(g_L.sortBtn, p)) {
@@ -2176,6 +2559,10 @@ void OnKeyDown(HWND hwnd, WPARAM key) {
         ToggleFullscreen(hwnd);
         return;
     }
+    if (key == 'F' && GetKeyState(VK_CONTROL) < 0) {  // Ctrl+F jumps to the search field
+        SetFocus(g_searchEdit);
+        return;
+    }
     if (key == VK_ESCAPE) {
         if (g_menu.open) CloseMenu(hwnd);
         else if (g_fullscreen) ToggleFullscreen(hwnd);
@@ -2206,6 +2593,12 @@ void OnCreate(HWND hwnd) {
     g_editFont = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
     g_editBrush = CreateSolidBrush(RGB(31, 31, 31));
+    g_searchEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        0, 0, 100, 20, hwnd, (HMENU)(INT_PTR)ID_SEARCH_EDIT, GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(g_searchEdit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
+    SendMessageW(g_searchEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Spiele suchen");  // stays visible while focused
+    SetWindowSubclass(g_searchEdit, SearchEditProc, 3, 0);
+
     g_renameEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
         0, 0, 100, 20, hwnd, (HMENU)(INT_PTR)ID_RENAME_EDIT, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(g_renameEdit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
@@ -2239,9 +2632,81 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_GETMINMAXINFO: {
         RECT r{ 0, 0, S(kMinClientWidth), S(kMinClientHeight) };
         AdjustWindowRectEx(&r, WINDOW_STYLE, FALSE, 0);
-        ((MINMAXINFO*)lp)->ptMinTrackSize = { r.right - r.left, r.bottom - r.top };
+        // The title bar is part of the client area (see WM_NCCALCSIZE), so only the side and bottom borders count.
+        ((MINMAXINFO*)lp)->ptMinTrackSize = { r.right - r.left, r.bottom };
         return 0;
     }
+
+    // The window draws its own title bar: the client area starts at the very top, like Spotify's.
+    case WM_NCCALCSIZE:
+        if (wp) {
+            auto* params = (NCCALCSIZE_PARAMS*)lp;
+            LONG top = params->rgrc[0].top;
+            DefWindowProcW(hwnd, msg, wp, lp);  // the usual client rectangle with the side and bottom borders
+            params->rgrc[0].top = top;
+            // A maximized window reaches beyond the screen by the width of its frame.
+            if (IsZoomed(hwnd)) params->rgrc[0].top += GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+            return 0;
+        }
+        break;
+
+    case WM_NCHITTEST: {
+        LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);  // side and bottom borders, window edges
+        if (hit != HTCLIENT) return hit;
+        POINT p{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        ScreenToClient(hwnd, &p);
+        if (!g_fullscreen) {
+            int caption = CaptionButtonAt(p);
+            if (caption >= 0) return caption == 0 ? HTMINBUTTON : caption == 1 ? HTMAXBUTTON : HTCLOSE;
+            int edge = GetSystemMetrics(SM_CYSIZEFRAME);  // the top edge resizes, too
+            if (!IsZoomed(hwnd) && p.y < edge) {
+                RECT client;
+                GetClientRect(hwnd, &client);
+                return p.x < edge ? HTTOPLEFT : p.x >= client.right - edge ? HTTOPRIGHT : HTTOP;
+            }
+        }
+        // The empty part of the top bar moves the window; the search field and the avatar area stay clickable.
+        if (In(g_L.topBar, p) && !In(g_L.search, p)) return HTCAPTION;
+        return HTCLIENT;
+    }
+
+    case WM_NCMOUSEMOVE: {
+        POINT p{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        ScreenToClient(hwnd, &p);
+        int hover = g_fullscreen ? -1 : CaptionButtonAt(p);
+        if (hover != g_captionHover) {
+            g_captionHover = hover;
+            InvalidateRect(hwnd, &g_L.topBar, FALSE);
+        }
+        TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE | TME_NONCLIENT, hwnd, 0 };
+        TrackMouseEvent(&track);
+        break;
+    }
+
+    case WM_NCMOUSELEAVE:
+        g_captionHover = g_captionPressed = -1;
+        InvalidateRect(hwnd, &g_L.topBar, FALSE);
+        break;
+
+    case WM_NCLBUTTONDOWN:
+        if (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) {
+            g_captionPressed = wp == HTMINBUTTON ? 0 : wp == HTMAXBUTTON ? 1 : 2;
+            return 0;
+        }
+        break;
+
+    case WM_NCLBUTTONUP:
+        if (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) {
+            int button = wp == HTMINBUTTON ? 0 : wp == HTMAXBUTTON ? 1 : 2;
+            bool pressed = g_captionPressed == button;
+            g_captionPressed = -1;
+            if (pressed) {
+                WPARAM command = button == 0 ? SC_MINIMIZE : button == 1 ? (IsZoomed(hwnd) ? SC_RESTORE : SC_MAXIMIZE) : SC_CLOSE;
+                PostMessageW(hwnd, WM_SYSCOMMAND, command, 0);
+            }
+            return 0;
+        }
+        break;
 
     case WM_ERASEBKGND:
         return 1;
@@ -2322,6 +2787,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_COMMAND: {
         int id = LOWORD(wp);
+        if (id == ID_SEARCH_EDIT) {
+            WORD code = HIWORD(wp);
+            if (code == EN_CHANGE) ApplySearch(hwnd);
+            if (code == EN_SETFOCUS || code == EN_KILLFOCUS) InvalidateRect(hwnd, &g_L.search, FALSE);
+            return 0;
+        }
         if (id == ID_RENAME_EDIT) {
             if (HIWORD(wp) == EN_KILLFOCUS) EndRename(hwnd, false);  // clicking away cancels
             return 0;
@@ -2344,6 +2815,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_SCANDONE:
         OnScanDone(hwnd, (std::map<std::wstring, Game>*)lp);
+        return 0;
+
+    case WM_OWNED:
+        OnOwned(hwnd, (OwnedResult*)lp);
         return 0;
 
     case WM_CLASSIFIED:
@@ -2377,6 +2852,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     CreateDirectoryW(g_coverDir.c_str(), nullptr);
     LoadSettings();
     LoadTypes();
+    LoadOwned();
     LoadSteamUser();
     LoadAvatar();
     MergeGames(ScanSteamGames());
@@ -2393,8 +2869,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
 
     RECT frame{ 0, 0, S(kStartClientWidth), S(kStartClientHeight) };
     AdjustWindowRectEx(&frame, WINDOW_STYLE, FALSE, 0);
-    HWND hwnd = CreateWindowExW(0, className, L"Steam Game Randomizer", WINDOW_STYLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, frame.right - frame.left, frame.bottom - frame.top,
+    int width = frame.right - frame.left, height = frame.bottom;  // no title bar above the client area
+    RECT work{ 0, 0, width, height };
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int x = work.left + std::max(0, (int)(work.right - work.left - width) / 2);
+    int y = work.top + std::max(0, (int)(work.bottom - work.top - height) / 2);
+    HWND hwnd = CreateWindowExW(0, className, L"Steam Game Randomizer", WINDOW_STYLE, x, y, width, height,
         nullptr, nullptr, instance, nullptr);
     if (!hwnd) {
         GdiplusShutdown(gdiToken);
