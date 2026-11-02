@@ -118,10 +118,7 @@ namespace {
         return fixed;
     }
 
-    std::vector<fs::path> FindSteamLibraries() {
-        std::set<std::wstring> unique;
-        std::vector<fs::path> libraries;
-
+    std::wstring GetSteamPath() {
         std::wstring steam = GetRegistryString(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath");
         if (steam.empty())
             steam = GetRegistryString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Valve\\Steam", L"InstallPath");
@@ -130,6 +127,14 @@ namespace {
             if (GetEnvironmentVariableW(L"PROGRAMFILES(X86)", programFiles, MAX_PATH))
                 steam = std::wstring(programFiles) + L"\\Steam";
         }
+        return steam;
+    }
+
+    std::vector<fs::path> FindSteamLibraries() {
+        std::set<std::wstring> unique;
+        std::vector<fs::path> libraries;
+
+        std::wstring steam = GetSteamPath();
         if (steam.empty()) return libraries;
 
         fs::path steamPath(steam);
@@ -262,6 +267,100 @@ namespace {
     }
 
     void ScanAndMerge() { MergeGames(ScanSteamGames()); }
+
+    // Reads a JSON string body starting right after the opening quote and decodes its escapes.
+    std::wstring ReadJsonString(const std::wstring& text, size_t pos) {
+        std::wstring out;
+        for (; pos < text.size() && text[pos] != L'"'; ++pos) {
+            if (text[pos] != L'\\' || pos + 1 >= text.size()) { out += text[pos]; continue; }
+            wchar_t c = text[++pos];
+            if (c == L'n') out += L'\n';
+            else if (c == L't') out += L'\t';
+            else if (c == L'u' && pos + 4 < text.size()) {
+                out += (wchar_t)std::wcstoul(text.substr(pos + 1, 4).c_str(), nullptr, 16);
+                pos += 4;
+            } else out += c;
+        }
+        return out;
+    }
+
+    struct ImportResult {
+        int categories = 0;
+        int games = 0;
+    };
+
+    // Steam keeps collections in userdata/<account>/config/cloudstorage. Only collections that contain
+    // at least one installed game are imported, and only games without a category are moved into them.
+    // Smaller collections go first so a game lands in its most specific collection.
+    ImportResult ImportSteamCategories() {
+        struct Collection {
+            std::wstring name;
+            std::vector<Game*> members;
+        };
+        std::vector<Collection> collections;
+
+        std::wstring steam = GetSteamPath();
+        std::error_code ec;
+        if (!steam.empty()) {
+            for (fs::directory_iterator it(fs::path(steam) / L"userdata", ec), end; !ec && it != end; it.increment(ec)) {
+                std::wstring text = ReadTextFile(it->path() / L"config" / L"cloudstorage" / L"cloud-storage-namespace-1.json");
+                const std::wstring keyMarker = L"\"key\":\"user-collections.";
+                size_t pos = 0;
+                while ((pos = text.find(keyMarker, pos)) != std::wstring::npos) {
+                    size_t next = pos + keyMarker.size();
+                    size_t entryEnd = text.find(L"}],[", pos);
+                    size_t valuePos = text.find(L"\"value\":\"", pos);
+                    bool hidden = ReadJsonString(text, next) == L"hidden";
+                    pos = next;
+                    if (hidden || valuePos == std::wstring::npos || valuePos > entryEnd) continue;
+
+                    std::wstring inner = ReadJsonString(text, valuePos + 9);
+                    size_t namePos = inner.find(L"\"name\":\"");
+                    size_t addedPos = inner.find(L"\"added\":[");
+                    if (namePos == std::wstring::npos || addedPos == std::wstring::npos) continue;
+
+                    Collection collection;
+                    collection.name = ReadJsonString(inner, namePos + 8);
+                    size_t listEnd = inner.find(L']', addedPos);
+                    std::wstring list = inner.substr(addedPos + 9, listEnd - addedPos - 9);
+                    size_t start = 0;
+                    while (start < list.size()) {
+                        size_t comma = list.find(L',', start);
+                        if (comma == std::wstring::npos) comma = list.size();
+                        std::wstring id = list.substr(start, comma - start);
+                        for (auto& game : g_games)
+                            if (!game.name.empty() && game.appId == id) collection.members.push_back(&game);
+                        start = comma + 1;
+                    }
+                    if (!collection.name.empty() && !collection.members.empty()) collections.push_back(collection);
+                }
+            }
+        }
+
+        std::stable_sort(collections.begin(), collections.end(), [](const Collection& a, const Collection& b) {
+            return a.members.size() < b.members.size();
+        });
+
+        ImportResult result;
+        for (const auto& collection : collections) {
+            const std::wstring& name = collection.name;
+            if (name == L"Alle Spiele" || name == L"Unsortiert" || name.find_first_of(L"\t\r\n") != std::wstring::npos)
+                continue;
+            bool exists = std::find(g_categories.begin(), g_categories.end(), name) != g_categories.end();
+            int assigned = 0;
+            for (Game* game : collection.members)
+                if (game->category == L"Unsortiert") ++assigned;
+            if (assigned == 0) continue;
+            if (!exists) {
+                g_categories.push_back(name);
+                ++result.categories;
+            }
+            for (Game* game : collection.members)
+                if (game->category == L"Unsortiert") game->category = name;
+            result.games += assigned;
+        }
+        return result;
+    }
 
     // ---------------------------------------------------------------- covers
 
@@ -406,7 +505,7 @@ namespace {
 
     constexpr int ID_EDIT = 2001;
     constexpr int ID_ACTION = 3000;
-    enum { BTN_CREATE, BTN_SCAN, BTN_LAUNCH, BTN_COUNT };
+    enum { BTN_CREATE, BTN_SCAN, BTN_IMPORT, BTN_LAUNCH, BTN_COUNT };
     constexpr DWORD WINDOW_STYLE = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
     constexpr UINT WM_SCANDONE = WM_APP + 2;
 
@@ -442,6 +541,10 @@ namespace {
     int g_sel = -1;
     int g_scroll = 0;
     int g_hoverRow = -1, g_hoverBtn = -1, g_hoverChip = -1;
+    int g_importState = 0;       // 0 idle, 2 showing the import result
+    bool g_importFound = false;
+    std::wstring g_importText;
+    ULONGLONG g_importTick = 0;
     int g_scanState = 0;         // 0 idle, 1 scanning, 2 done (shows a check mark)
     bool g_scanReady = false;
     ULONGLONG g_scanTick = 0, g_checkTick = 0;
@@ -517,10 +620,10 @@ namespace {
 
         int ph = S(40);
         int py = g_L.bar.top + (S(76) - ph) / 2;
-        g_L.pill = { S(20), py, S(20) + S(170), py + ph };
+        g_L.pill = { S(20), py, S(20) + S(150), py + ph };
         int x = g_L.pill.right + S(8);
-        const int widths[] = { S(92), S(124) };
-        for (int i = 0; i < 2; ++i) {
+        const int widths[] = { S(88), S(112), S(140) };
+        for (int i = 0; i < 3; ++i) {
             g_L.btn[i] = { x, py, x + widths[i], py + ph };
             x += widths[i] + S(8);
         }
@@ -650,14 +753,16 @@ namespace {
             RectF(tx, slot.Y + S(32), tw, (REAL)S(18)));
     }
 
-    // Spinner while scanning, animated check mark once the scan is done.
-    void DrawScanContent(Graphics& g, RectF r) {
-        const wchar_t* text = g_scanState == 1 ? L"Scannt…" : L"Fertig";
+    enum StatusIcon { ICON_SPINNER, ICON_CHECK, ICON_NONE };
+
+    // Button status: spinner, animated check mark (since = tick it started) or text only.
+    void DrawStatusContent(Graphics& g, RectF r, const std::wstring& text, StatusIcon mode, ULONGLONG since) {
         FontFamily family(L"Arial");
         Font font(&family, (REAL)S(13), FontStyleBold, UnitPixel);
         RectF box;
-        g.MeasureString(text, -1, &font, PointF(0, 0), &box);
-        REAL icon = (REAL)S(16), gap = (REAL)S(6), textW = box.Width - S(8);
+        g.MeasureString(text.c_str(), -1, &font, PointF(0, 0), &box);
+        REAL icon = mode == ICON_NONE ? 0.0f : (REAL)S(16);
+        REAL gap = mode == ICON_NONE ? 0.0f : (REAL)S(6), textW = box.Width - S(8);
         REAL startX = r.X + (r.Width - (icon + gap + textW)) / 2;
         REAL cx = startX + icon / 2, cy = r.Y + r.Height / 2;
 
@@ -665,11 +770,11 @@ namespace {
         pen.SetStartCap(LineCapRound);
         pen.SetEndCap(LineCapRound);
         pen.SetLineJoin(LineJoinRound);
-        if (g_scanState == 1) {
+        if (mode == ICON_SPINNER) {
             REAL angle = (REAL)(GetTickCount64() % 800) / 800.0f * 360.0f;
             g.DrawArc(&pen, cx - icon / 2 + 1, cy - icon / 2 + 1, icon - 2, icon - 2, angle, 270);
-        } else {
-            double t = std::min(1.0, (double)(GetTickCount64() - g_checkTick) / 260.0);
+        } else if (mode == ICON_CHECK) {
+            double t = std::min(1.0, (double)(GetTickCount64() - since) / 260.0);
             double e = 1.0 - std::pow(1.0 - t, 3.0);
             REAL k = (REAL)S(1);
             PointF a(cx - 5 * k, cy + 0.5f * k), b(cx - 1.5f * k, cy + 4 * k), c(cx + 6 * k, cy - 4 * k);
@@ -757,7 +862,7 @@ namespace {
             g.DrawPath(&pen, &path);
         }
 
-        const wchar_t* labels[BTN_COUNT] = { L"Erstellen", L"Neu scannen", L"Zufällig starten" };
+        const wchar_t* labels[BTN_COUNT] = { L"Erstellen", L"Neu scannen", L"Aus Steam holen", L"Zufällig starten" };
         for (int i = 0; i < BTN_COUNT; ++i) {
             RectF r = RF(g_L.btn[i]);
             bool hover = i == g_hoverBtn;
@@ -767,10 +872,15 @@ namespace {
             } else {
                 GraphicsPath path;
                 RoundPath(path, RectF(r.X + 0.5f, r.Y + 0.5f, r.Width - 1, r.Height - 1), r.Height / 2);
-                bool busy = i == BTN_SCAN && g_scanState != 0;
+                bool scanBusy = i == BTN_SCAN && g_scanState != 0;
+                bool importBusy = i == BTN_IMPORT && g_importState != 0;
+                bool busy = scanBusy || importBusy;
                 Pen pen(busy ? kAccent : (hover ? kText : kOutline), 1.0f);
                 g.DrawPath(&pen, &path);
-                if (busy) DrawScanContent(g, r);
+                if (scanBusy) DrawStatusContent(g, r, g_scanState == 1 ? L"Scannt…" : L"Fertig",
+                    g_scanState == 1 ? ICON_SPINNER : ICON_CHECK, g_checkTick);
+                else if (importBusy) DrawStatusContent(g, r, g_importText,
+                    g_importFound ? ICON_CHECK : ICON_NONE, g_importTick);
                 else DrawLabel(g, labels[i], (REAL)S(13), true, kText, r, StringAlignmentCenter, StringAlignmentCenter);
             }
         }
@@ -888,6 +998,23 @@ namespace {
         SaveSettings();
     }
 
+    void ImportFromSteam(HWND hwnd) {
+        ImportResult result = ImportSteamCategories();
+        if (result.games > 0) {
+            SaveSettings();
+            RefreshGames();
+            Relayout(hwnd);
+        }
+        g_importFound = result.games > 0;
+        g_importText = g_importFound
+            ? std::to_wstring(result.categories) + (result.categories == 1 ? L" Kategorie" : L" Kategorien")
+            : L"Nichts Neues";
+        g_importState = 2;
+        g_importTick = GetTickCount64();
+        SetTimer(hwnd, 2, 16, nullptr);
+        InvalidateRect(hwnd, &g_L.btn[BTN_IMPORT], FALSE);
+    }
+
     void Rescan(HWND hwnd) {
         if (g_scanState == 1) return;
         g_scanState = 1;
@@ -977,7 +1104,7 @@ namespace {
             return 0;
 
         case WM_GETMINMAXINFO: {
-            RECT r{ 0, 0, S(740), S(520) };
+            RECT r{ 0, 0, S(760), S(520) };
             AdjustWindowRectEx(&r, WINDOW_STYLE, FALSE, 0);
             ((MINMAXINFO*)lp)->ptMinTrackSize = { r.right - r.left, r.bottom - r.top };
             return 0;
@@ -1118,6 +1245,7 @@ namespace {
             switch (id - ID_ACTION) {
             case BTN_CREATE: AddCategory(hwnd); return 0;
             case BTN_SCAN: Rescan(hwnd); return 0;
+            case BTN_IMPORT: ImportFromSteam(hwnd); return 0;
             case BTN_LAUNCH: LaunchRandom(hwnd); return 0;
             }
             break;
@@ -1141,6 +1269,13 @@ namespace {
         }
 
         case WM_TIMER:
+            if (wp == 2) {
+                if (GetTickCount64() - g_importTick >= 2200) {
+                    g_importState = 0;
+                    KillTimer(hwnd, 2);
+                }
+                InvalidateRect(hwnd, &g_L.btn[BTN_IMPORT], FALSE);
+            }
             if (wp == 1) {
                 ULONGLONG now = GetTickCount64();
                 if (g_scanState == 1 && g_scanReady && now - g_scanTick >= 700) {
@@ -1195,7 +1330,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
     RegisterClassW(&wc);
 
-    RECT frame{ 0, 0, S(760), S(640) };
+    RECT frame{ 0, 0, S(780), S(640) };
     AdjustWindowRectEx(&frame, WINDOW_STYLE, FALSE, 0);
     HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"Steam Game Randomizer",
         WINDOW_STYLE, CW_USEDEFAULT, CW_USEDEFAULT,

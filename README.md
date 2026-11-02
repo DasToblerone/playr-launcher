@@ -5,6 +5,7 @@ Startet ein zufälliges installiertes Steam-Spiel. Die Oberfläche ist an Spotif
 - Erkennt installierte Spiele automatisch aus allen Steam-Bibliotheken
 - Titelbilder kommen von Steam und werden lokal zwischengespeichert
 - Eigene Kategorien: Spiele per Drag and Drop auf eine Kategorie ziehen, Rechtsklick auf eine Kategorie löscht sie
+- „Aus Steam holen“ importiert deine Steam-Sammlungen (nur die mit installierten Spielen)
 - Ein Klick auf das Titelbild startet genau dieses Spiel, „Zufällig starten“ wählt eins aus der aktuellen Kategorie
 
 ## Bauen
