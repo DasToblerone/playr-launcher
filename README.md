@@ -17,9 +17,7 @@ Du brauchst Windows 10 oder 11 und den C++-Compiler von Microsoft.
    winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
    ```
 2. **Quellcode holen:** auf GitHub „Code“, dann „Download ZIP“ und entpacken, oder `git clone https://github.com/DasToblerone/steam-game-randomizer`.
-3. **`build.bat` doppelklicken.** Nach etwa einer halben Minute liegt `SteamGameRandomizer.exe` im selben Ordner.
-
-Ohne das Skript, in der „x64 Native Tools Command Prompt für VS“ im Ordner des Quellcodes:
+3. **Bauen:** im Startmenü die „x64 Native Tools Command Prompt für VS“ öffnen, mit `cd` in den Ordner des Quellcodes wechseln und diese zwei Befehle eingeben. Nach etwa einer halben Minute liegt `SteamGameRandomizer.exe` im selben Ordner.
 
 ```
 rc /nologo SteamGameRandomizer.rc
