@@ -1,10 +1,10 @@
-# Steam Game Randomizer
+﻿# Steam Game Randomizer
 
 Startet ein zufälliges installiertes Steam-Spiel. Die Oberfläche ist an Spotifys Darkmode angelehnt: fast schwarz, lila Akzent, Arial.
 
 - Erkennt installierte Spiele automatisch aus allen Steam-Bibliotheken
 - Titelbilder kommen von Steam und werden lokal zwischengespeichert
-- Eigene Kategorien: Spiele per Drag and Drop auf eine Kategorie ziehen, Rechtsklick auf eine Kategorie löscht sie
+- Eigene Kategorien: Spiele per Drag and Drop auf eine Kategorie ziehen, Rechtsklick auf eine Kategorie öffnet ein Menü zum Umbenennen und Löschen
 - „Aus Steam holen“ importiert deine Steam-Sammlungen (nur die mit installierten Spielen)
 - Ein Klick auf das Titelbild startet genau dieses Spiel, „Zufällig starten“ wählt eins aus der aktuellen Kategorie
 
