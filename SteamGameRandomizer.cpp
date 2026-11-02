@@ -52,28 +52,46 @@ namespace {
 struct Game {
     std::wstring appId;
     std::wstring name;
-    std::wstring category = L"Unsortiert";
+    std::vector<std::wstring> categories;  // a game can be in any number of categories
     int playtimeMinutes = 0;
     long long lastPlayed = 0;  // unix time, 0 when never played
+    long long sizeBytes = 0;   // install size from the Steam manifest, 0 when unknown
+
+    bool InCategory(const std::wstring& category) const {
+        return std::find(categories.begin(), categories.end(), category) != categories.end();
+    }
+    // Returns false when the game already was in the category.
+    bool AddCategory(const std::wstring& category) {
+        if (InCategory(category)) return false;
+        categories.push_back(category);
+        return true;
+    }
+    void RemoveCategory(const std::wstring& category) {
+        categories.erase(std::remove(categories.begin(), categories.end(), category), categories.end());
+    }
 };
 
 const std::wstring kAllGames = L"Alle Spiele";
-const std::wstring kUnsorted = L"Unsortiert";
+
+enum class SortKey { Name, Playtime, LastPlayed, Size };
+SortKey g_sortKey = SortKey::Name;
+bool g_sortDescending = false;
 
 std::vector<Game> g_games;
-std::vector<std::wstring> g_categories{ kAllGames };  // chips; games without one carry kUnsorted internally
+std::vector<std::wstring> g_categories{ kAllGames };  // sidebar rows; "Alle Spiele" is always the first
 std::map<std::wstring, bool> g_isGame;   // appId -> verdict from the Steam store, cached on disk
 
 std::wstring g_dataDir;
 std::wstring g_coverDir;
 std::wstring g_steamName;  // persona name of the Steam account that signed in last
+std::wstring g_steamId;    // its SteamID64, which names the avatar file in Steam's cache
 
 fs::path SettingsPath() { return fs::path(g_dataDir) / L"settings.txt"; }
 fs::path TypesPath() { return fs::path(g_dataDir) / L"types.txt"; }
 fs::path CoverPath(const std::wstring& appId) { return fs::path(g_coverDir) / (appId + L".jpg"); }
 fs::path PortraitPath(const std::wstring& appId) { return fs::path(g_coverDir) / (appId + L"_p.jpg"); }
 
-bool IsReservedCategory(const std::wstring& name) { return name == kAllGames || name == kUnsorted; }
+bool IsReservedCategory(const std::wstring& name) { return name == kAllGames; }
 
 // ============================================================================ file helpers
 
@@ -208,6 +226,7 @@ std::map<std::wstring, Game> ScanSteamGames() {
             game.appId = VdfValue(vdf, L"appid");
             game.name = VdfValue(vdf, L"name");
             if (game.appId.empty() || game.name.empty() || IsSteamTool(game.name)) continue;
+            game.sizeBytes = _wtoi64(VdfValue(vdf, L"SizeOnDisk").c_str());
             found[game.appId] = game;
         }
     }
@@ -238,8 +257,7 @@ struct ImportResult {
 };
 
 // Steam keeps collections in userdata/<account>/config/cloudstorage. Only collections that hold at
-// least one installed game are imported, and only games without a category are moved into them.
-// Smaller collections go first so a game lands in its most specific collection.
+// least one installed game are imported; their games are added to the category of the same name.
 ImportResult ImportSteamCategories() {
     struct Collection {
         std::wstring name;
@@ -284,24 +302,20 @@ ImportResult ImportSteamCategories() {
         }
     }
 
-    std::stable_sort(collections.begin(), collections.end(), [](const Collection& a, const Collection& b) {
-        return a.members.size() < b.members.size();
-    });
-
     ImportResult result;
     for (const auto& collection : collections) {
         const std::wstring& name = collection.name;
         if (IsReservedCategory(name) || name.find_first_of(L"\t\r\n") != std::wstring::npos) continue;
-        int assignable = (int)std::count_if(collection.members.begin(), collection.members.end(),
-            [](const Game* game) { return game->category == kUnsorted; });
-        if (assignable == 0) continue;
-        if (std::find(g_categories.begin(), g_categories.end(), name) == g_categories.end()) {
+        int added = (int)std::count_if(collection.members.begin(), collection.members.end(),
+            [&](const Game* game) { return !game->InCategory(name); });
+        bool isNew = std::find(g_categories.begin(), g_categories.end(), name) == g_categories.end();
+        if (added == 0 && !isNew) continue;
+        if (isNew) {
             g_categories.push_back(name);
             ++result.categories;
         }
-        for (Game* game : collection.members)
-            if (game->category == kUnsorted) game->category = name;
-        result.games += assignable;
+        for (Game* game : collection.members) game->AddCategory(name);
+        result.games += added;
     }
     return result;
 }
@@ -317,12 +331,15 @@ void SaveSettings() {
         WriteUtf8(file, category);
         file << "\r\n";
     }
+    file << "S\t" << (int)g_sortKey << '\t' << (g_sortDescending ? 1 : 0) << "\r\n";
     for (const auto& game : g_games) {
-        file << "G\t";
-        WriteUtf8(file, game.appId);
-        file << '\t';
-        WriteUtf8(file, game.category);
-        file << "\r\n";
+        for (const auto& category : game.categories) {  // one line per membership
+            file << "G\t";
+            WriteUtf8(file, game.appId);
+            file << '\t';
+            WriteUtf8(file, category);
+            file << "\r\n";
+        }
     }
 }
 
@@ -333,11 +350,20 @@ void LoadSettings() {
             std::wstring category = line.substr(2);
             if (!category.empty() && std::find(g_categories.begin(), g_categories.end(), category) == g_categories.end())
                 g_categories.push_back(category);
+        } else if (line.rfind(L"S\t", 0) == 0) {
+            size_t split = line.find(L'\t', 2);
+            int key = _wtoi(line.substr(2, split == std::wstring::npos ? split : split - 2).c_str());
+            if (key >= 0 && key <= (int)SortKey::Size) g_sortKey = (SortKey)key;
+            g_sortDescending = split != std::wstring::npos && line.compare(split + 1, 1, L"1") == 0;
         } else if (line.rfind(L"G\t", 0) == 0) {
             size_t split = line.find(L'\t', 2);
             if (split == std::wstring::npos) return;
             std::wstring id = line.substr(2, split - 2), category = line.substr(split + 1);
-            if (!id.empty() && !category.empty()) g_games.push_back({ id, L"", category });
+            if (id.empty() || category.empty()) return;
+            Game saved;
+            saved.appId = id;
+            saved.categories = { category };
+            g_games.push_back(saved);
         }
     });
 }
@@ -358,15 +384,22 @@ void LoadTypes() {
     });
 }
 
-std::wstring SteamPersonaName() {
+// Reads the account that signed in last from loginusers.vdf: its SteamID64 (the key of its block) and persona name.
+void LoadSteamUser() {
     std::wstring text = ReadTextFile(fs::path(SteamPath()) / L"config" / L"loginusers.vdf");
+    size_t nameKey = std::wstring::npos;
     // Several accounts can be listed; prefer the one marked as the most recent.
     for (size_t pos = 0; (pos = text.find(L"\"MostRecent\"", pos)) != std::wstring::npos; pos += 12) {
         if (VdfValue(text, L"MostRecent", pos) != L"1") continue;
-        size_t name = text.rfind(L"\"PersonaName\"", pos);
-        if (name != std::wstring::npos) return VdfValue(text, L"PersonaName", name);
+        nameKey = text.rfind(L"\"PersonaName\"", pos);
+        break;
     }
-    return VdfValue(text, L"PersonaName");
+    if (nameKey == std::wstring::npos) nameKey = text.find(L"\"PersonaName\"");
+    if (nameKey == std::wstring::npos) return;
+
+    g_steamName = VdfValue(text, L"PersonaName", nameKey);
+    size_t idKey = text.rfind(L"\"7656", nameKey);  // SteamID64s all start with 7656
+    if (idKey != std::wstring::npos) g_steamId = ReadJsonString(text, idKey + 1);
 }
 
 // Position of the brace that closes the block opened at `open`.
@@ -403,19 +436,19 @@ void ApplyPlayStats() {
 
 // Replaces the game list with `detected`, keeping saved category assignments and dropping known non-games.
 void MergeGames(const std::map<std::wstring, Game>& detected) {
-    std::map<std::wstring, std::wstring> assignments;
+    std::map<std::wstring, std::vector<std::wstring>> assignments;
     for (const auto& game : g_games)
-        if (!game.appId.empty() && !game.category.empty()) assignments[game.appId] = game.category;
+        for (const auto& category : game.categories)
+            if (!game.appId.empty()) assignments[game.appId].push_back(category);
 
     g_games.clear();
     for (const auto& entry : detected) {
         Game game = entry.second;
         auto verdict = g_isGame.find(game.appId);
         if (verdict != g_isGame.end() && !verdict->second) continue;
-        auto saved = assignments.find(game.appId);
-        if (saved != assignments.end() &&
-            std::find(g_categories.begin(), g_categories.end(), saved->second) != g_categories.end())
-            game.category = saved->second;
+        for (const auto& category : assignments[game.appId])
+            if (std::find(g_categories.begin(), g_categories.end(), category) != g_categories.end())
+                game.AddCategory(category);  // categories that no longer exist are dropped
         g_games.push_back(game);
     }
     std::sort(g_games.begin(), g_games.end(), [](const Game& a, const Game& b) {
@@ -626,7 +659,7 @@ using namespace Gdiplus;
 constexpr float kMargin = 24, kRowHeight = 64, kRowInset = 14, kNumberColumn = 52;
 constexpr float kCoverWidth = 96, kCoverHeight = 45;
 constexpr float kPanelGap = 8, kSidebarWidth = 300, kSideHeader = 56, kSideRow = 64, kSideTile = 48;
-constexpr float kMainHeader = 112;
+constexpr float kMainHeader = 82, kTopBar = 60;
 constexpr float kMenuWidth = 176, kMenuItemHeight = 38, kMenuPad = 6;
 constexpr float kBarHeight = 76, kControlHeight = 40, kBarMargin = 20, kGap = 8;
 constexpr float kRandomWidth = 190;
@@ -643,7 +676,7 @@ constexpr float kGridMinWidth = 820, kCardPad = 12, kCardGap = 8, kCardTargetWid
 
 
 enum { BTN_SCAN, BTN_IMPORT, BTN_RANDOM, BTN_COUNT };
-enum class Icon { None, Refresh, Download, Plus, Library, Folder };
+enum class Icon { None, Refresh, Download, Plus, Library, Folder, Sort };
 const wchar_t* const kButtonLabels[BTN_COUNT] = { L"Neu scannen", L"Kategorien aus Steam", L"Zufällig auswählen" };
 const Icon kButtonIcons[BTN_COUNT] = { Icon::Refresh, Icon::Download, Icon::None };
 const float kButtonWidths[BTN_COUNT - 1] = { 140, 200 };
@@ -670,6 +703,8 @@ struct Layout {
     RECT bar{};
     RECT btn[BTN_COUNT]{};
     RECT sidebar{}, main{}, sideList{}, create{};  // create: "+ Erstellen" in the sidebar header
+    RECT topBar{};
+    RECT sortBtn{};                             // "Sortieren" at the top right of the main panel
     std::vector<RECT> chips;  // one row of the sidebar per category
     int rowH = 0;  // vertical step between rows of items (list rows or card rows)
     int wheelStep = 0;
@@ -682,16 +717,21 @@ struct Hover {
     bool cover = false;
     int menuItem = -1;
     bool sideCreate = false;
-    bool Any() const { return row >= 0 || button >= 0 || chip >= 0 || menuItem >= 0 || sideCreate; }
+    bool sortBtn = false;
+    bool Any() const { return row >= 0 || button >= 0 || chip >= 0 || menuItem >= 0 || sideCreate || sortBtn; }
 };
 
-// Context menu of a category chip, opened with the right mouse button.
+// Context menu, opened with the right mouse button on a category row or on a game.
 struct Menu {
-    enum Item { Rename, Delete, ItemCount };
+    enum Action { Rename, Delete, RemoveFromCategory, SortByName, SortByPlaytime, SortByLastPlayed, SortBySize };
+    static constexpr int kMaxItems = 4;
     bool open = false;
-    int chip = -1;
+    int chip = -1;  // the category it belongs to
+    int game = -1;  // index into g_games for a game menu
+    int count = 0;
+    Action actions[kMaxItems]{};
     RECT rect{};
-    RECT items[ItemCount]{};
+    RECT items[kMaxItems]{};
 };
 
 // A short message above the bottom bar.
@@ -716,6 +756,10 @@ struct Badge {
     ULONGLONG since = 0;
     ULONGLONG hideAfter = 0;  // ms, for Check and Text
 };
+
+Bitmap* g_avatar = nullptr;        // the Steam profile picture
+Bitmap* g_avatarBaked = nullptr;   // it, round and scaled for the top bar
+int g_avatarSize = 0;
 
 float g_scale = 1.0f;
 Layout g_L;
@@ -786,10 +830,25 @@ void RefreshGames() {
     g_visible.clear();
     bool selectionVisible = false;
     for (int i = 0; i < (int)g_games.size(); ++i) {
-        if (filter != kAllGames && g_games[i].category != filter) continue;
+        if (filter != kAllGames && !g_games[i].InCategory(filter)) continue;
         g_visible.push_back(i);
         selectionVisible |= i == g_sel;
     }
+    // Numbers sort largest first by default; ties and names fall back to the alphabet.
+    std::stable_sort(g_visible.begin(), g_visible.end(), [](int a, int b) {
+        const Game& x = g_games[a];
+        const Game& y = g_games[b];
+        long long keyX = 0, keyY = 0;
+        switch (g_sortKey) {
+        case SortKey::Playtime: keyX = x.playtimeMinutes; keyY = y.playtimeMinutes; break;
+        case SortKey::LastPlayed: keyX = x.lastPlayed; keyY = y.lastPlayed; break;
+        case SortKey::Size: keyX = x.sizeBytes; keyY = y.sizeBytes; break;
+        case SortKey::Name: break;
+        }
+        if (keyX != keyY) return g_sortDescending ? keyX > keyY : keyX < keyY;
+        int byName = _wcsicmp(x.name.c_str(), y.name.c_str());
+        return g_sortKey == SortKey::Name && g_sortDescending ? byName > 0 : byName < 0;
+    });
     if (!selectionVisible) g_sel = -1;
     ClampScroll();
 }
@@ -802,12 +861,17 @@ void Relayout(HWND hwnd) {
     // Two rounded panels on a black window, like Spotify: the library on the left, the games on the right.
     int gap = S(kPanelGap), panelBottom = H - S(kBarHeight);
     g_L.bar = { 0, panelBottom, W, H };
-    g_L.sidebar = { gap, gap, gap + S(kSidebarWidth), std::max(gap + S(100), panelBottom - S(4)) };
-    g_L.main = { g_L.sidebar.right + gap, gap, W - gap, g_L.sidebar.bottom };
+    int top = S(kTopBar);
+    g_L.topBar = { 0, 0, W, top };
+    g_L.sidebar = { gap, top, gap + S(kSidebarWidth), std::max(top + S(100), panelBottom - S(4)) };
+    g_L.main = { g_L.sidebar.right + gap, top, W - gap, g_L.sidebar.bottom };
     g_L.sideList = { g_L.sidebar.left, g_L.sidebar.top + S(kSideHeader), g_L.sidebar.right, g_L.sidebar.bottom - S(8) };
     int createW = S(104), createH = S(34);
     g_L.create = { g_L.sidebar.right - S(12) - createW, g_L.sidebar.top + (S(kSideHeader) - createH) / 2,
         g_L.sidebar.right - S(12), g_L.sidebar.top + (S(kSideHeader) - createH) / 2 + createH };
+    int sortW = S(200), sortH = S(34);
+    g_L.sortBtn = { g_L.main.right - S(kMargin) - sortW, g_L.main.top + S(24), g_L.main.right - S(kMargin),
+        g_L.main.top + S(24) + sortH };
     int listTop = g_L.main.top + S(kMainHeader);
     g_L.list = { g_L.main.left, listTop, g_L.main.right, std::max(listTop, (int)g_L.main.bottom - S(8)) };
 
@@ -838,12 +902,14 @@ void Relayout(HWND hwnd) {
 
     int ph = S(kControlHeight);
     int py = g_L.bar.top + (S(kBarHeight) - ph) / 2;
-    int x = S(kBarMargin);
+    // The buttons live in a column of at most 1300 pixels that stays centered, so they are easy to find in a big window.
+    int margin = std::max(S(kBarMargin), (W - S(1300)) / 2);
+    int x = margin;
     for (int i = 0; i < BTN_RANDOM; ++i) {
         g_L.btn[i] = { x, py, x + S(kButtonWidths[i]), py + ph };
         x += S(kButtonWidths[i]) + S(kGap);
     }
-    g_L.btn[BTN_RANDOM] = { W - S(kBarMargin) - S(kRandomWidth), py, W - S(kBarMargin), py + ph };
+    g_L.btn[BTN_RANDOM] = { W - margin - S(kRandomWidth), py, W - margin, py + ph };
 
     if (g_renameEdit && g_renameChip >= 0 && g_renameChip < (int)g_L.chips.size()) {
         RECT field = RenameRect(g_renameChip);
@@ -1104,11 +1170,28 @@ std::wstring Plural(long long n, const wchar_t* one, const wchar_t* many) {
 struct PlayParts {
     std::wstring playtime;  // "36 Std."
     std::wstring when;      // "vor 3 Tagen"
+    std::wstring size;      // "54,3 GB"
+    bool played = false;
 };
+
+// "54,3 GB" below ten gigabytes with one decimal, whole gigabytes above, megabytes for small games.
+std::wstring FormatSize(long long bytes) {
+    if (bytes <= 0) return {};
+    double gb = bytes / (1024.0 * 1024.0 * 1024.0);
+    wchar_t text[32];
+    if (gb < 1) swprintf_s(text, L"%.0f MB", bytes / (1024.0 * 1024.0));
+    else if (gb < 10) swprintf_s(text, L"%.1f GB", gb);
+    else swprintf_s(text, L"%.0f GB", gb);
+    std::wstring result = text;
+    std::replace(result.begin(), result.end(), L'.', L',');
+    return result;
+}
 
 PlayParts PlayStats(const Game& game) {
     PlayParts parts;
-    if (game.playtimeMinutes == 0 && game.lastPlayed == 0) {
+    parts.size = FormatSize(game.sizeBytes);
+    parts.played = game.playtimeMinutes > 0 || game.lastPlayed > 0;
+    if (!parts.played) {
         parts.playtime = L"Noch nicht gespielt";
         return parts;
     }
@@ -1139,12 +1222,18 @@ PlayParts PlayStats(const Game& game) {
     return parts;
 }
 
-// "36 Std. · Zuletzt gespielt vor 3 Tagen", for the one-line list rows
+// "36 Std. · Zuletzt gespielt vor 3 Tagen · 54 GB", for the one-line list rows
 std::wstring PlayInfo(const Game& game) {
     PlayParts parts = PlayStats(game);
-    if (parts.when.empty()) return parts.playtime;
-    std::wstring last = L"Zuletzt gespielt " + parts.when;
-    return parts.playtime.empty() ? last : parts.playtime + L"  ·  " + last;
+    std::wstring text = parts.playtime;
+    auto append = [&](const std::wstring& part) {
+        if (part.empty()) return;
+        text += text.empty() ? L"" : L"  ·  ";
+        text += part;
+    };
+    if (!parts.when.empty()) append(L"Zuletzt gespielt " + parts.when);
+    append(parts.size);
+    return text;
 }
 
 void DrawRow(Graphics& g, int visibleIndex, int W) {
@@ -1227,11 +1316,18 @@ void DrawCard(Graphics& g, int visibleIndex) {
 
     REAL textTop = art.GetBottom() + S(10);
     DrawLabel(g, game.name, (REAL)S(15), true, selected ? kAccentHover : kText, RectF(art.X, textTop, art.Width, (REAL)S(20)));
-    // Play time and last played on their own lines.
+    // Play time (with the size next to it) and last played on their own lines.
     PlayParts stats = PlayStats(game);
-    DrawLabel(g, stats.playtime, (REAL)S(13), false, kText2, RectF(art.X, textTop + S(22), art.Width, (REAL)S(17)));
-    if (!stats.when.empty())
-        DrawLabel(g, L"Zuletzt " + stats.when, (REAL)S(13), false, kText2, RectF(art.X, textTop + S(39), art.Width, (REAL)S(17)));
+    std::wstring first = stats.playtime, second;
+    if (stats.played) {
+        if (!stats.size.empty()) first += L"  ·  " + stats.size;
+        second = L"Zuletzt " + stats.when;
+    } else {
+        second = stats.size;  // "Noch nicht gespielt" is long, so the size gets the next line
+    }
+    DrawLabel(g, first, (REAL)S(13), false, kText2, RectF(art.X, textTop + S(22), art.Width, (REAL)S(17)));
+    if (!second.empty())
+        DrawLabel(g, second, (REAL)S(13), false, kText2, RectF(art.X, textTop + S(39), art.Width, (REAL)S(17)));
 }
 
 // ---------------------------------------------------------------- frame
@@ -1287,6 +1383,11 @@ void DrawIcon(Graphics& g, Icon icon, REAL cx, REAL cy, REAL size, const Color& 
         g.DrawLine(&pen, cx - h * 0.7f, cy, cx + h * 0.7f, cy);
         g.DrawLine(&pen, cx, cy - h * 0.7f, cx, cy + h * 0.7f);
         break;
+    case Icon::Sort:  // three bars that get shorter
+        g.DrawLine(&pen, cx - h * 0.85f, cy - h * 0.6f, cx + h * 0.85f, cy - h * 0.6f);
+        g.DrawLine(&pen, cx - h * 0.85f, cy, cx + h * 0.4f, cy);
+        g.DrawLine(&pen, cx - h * 0.85f, cy + h * 0.6f, cx - h * 0.05f, cy + h * 0.6f);
+        break;
     case Icon::Library:  // three bars, the last one leaning, like Spotify's library icon
         g.DrawLine(&pen, cx - h * 0.7f, cy - h * 0.75f, cx - h * 0.7f, cy + h * 0.75f);
         g.DrawLine(&pen, cx - h * 0.1f, cy - h * 0.75f, cx - h * 0.1f, cy + h * 0.75f);
@@ -1336,7 +1437,7 @@ void DrawCategoryTile(Graphics& g, int category, RectF tile) {
 
     std::vector<const Game*> games;
     for (const auto& game : g_games) {
-        if (category == 0 || game.category == g_categories[category]) games.push_back(&game);
+        if (category == 0 || game.InCategory(g_categories[category])) games.push_back(&game);
         if (games.size() == 4) break;
     }
     REAL cx = tile.X + tile.Width / 2, cy = tile.Y + tile.Height / 2;
@@ -1390,7 +1491,9 @@ void DrawSidebar(Graphics& g) {
             StrokeRound(g, r, (REAL)S(8), kAccent, 2.0f);
         } else if (dragging && i >= 1) {
             StrokeRound(g, r, (REAL)S(8), kAccent, 1.5f, true);
-        } else if (active || hovered) {
+        } else if (active) {
+            FillRound(g, r, (REAL)S(8), kSurface);  // same colors as the game cards: selected is lighter than hovered
+        } else if (hovered) {
             FillRound(g, r, (REAL)S(8), kSurfaceHover);
         }
 
@@ -1408,11 +1511,52 @@ void DrawSidebar(Graphics& g) {
             DrawLabel(g, g_categories[i], (REAL)S(15), true, name, RectF(tx, r.Y + S(12), tw, (REAL)S(22)));
         }
         int count = i == 0 ? (int)g_games.size()
-            : (int)std::count_if(g_games.begin(), g_games.end(), [&](const Game& game) { return game.category == g_categories[i]; });
+            : (int)std::count_if(g_games.begin(), g_games.end(), [&](const Game& game) { return game.InCategory(g_categories[i]); });
         DrawLabel(g, std::to_wstring(count) + (count == 1 ? L" Spiel" : L" Spiele"), (REAL)S(13), false, kText2,
             RectF(tx, r.Y + S(36), tw, (REAL)S(18)));
     }
     g.Restore(state);
+}
+
+const wchar_t* SortName(SortKey key) {
+    switch (key) {
+    case SortKey::Playtime: return L"Spielzeit";
+    case SortKey::LastPlayed: return L"Zuletzt gespielt";
+    case SortKey::Size: return L"Größe";
+    default: return L"Name";
+    }
+}
+
+const wchar_t* SortArrow(bool descending) { return descending ? L"↓" : L"↑"; }
+
+SortKey SortKeyOf(Menu::Action action) {
+    switch (action) {
+    case Menu::SortByPlaytime: return SortKey::Playtime;
+    case Menu::SortByLastPlayed: return SortKey::LastPlayed;
+    case Menu::SortBySize: return SortKey::Size;
+    default: return SortKey::Name;
+    }
+}
+
+// Picking the current key again flips the direction; a new key starts with its natural one
+// (alphabetical for names, largest or most recent first for the rest).
+void SelectSort(HWND hwnd, SortKey key) {
+    if (key == g_sortKey) {
+        g_sortDescending = !g_sortDescending;
+    } else {
+        g_sortKey = key;
+        g_sortDescending = key != SortKey::Name;
+    }
+    g_scroll = 0;
+    RefreshGames();
+    SaveSettings();
+    Redraw(hwnd);
+}
+
+void DrawSortButton(Graphics& g) {
+    RectF r = RF(g_L.sortBtn);
+    FillRound(g, r, r.Height / 2, g_hover.sortBtn ? kChipHover : kSurface);
+    DrawButtonContent(g, r, Icon::Sort, std::wstring(SortName(g_sortKey)) + L"  " + SortArrow(g_sortDescending), kText);
 }
 
 void DrawBar(Graphics& g, int W, int H) {
@@ -1445,17 +1589,34 @@ void DrawDragGhost(Graphics& g) {
 
 void DrawMenu(Graphics& g) {
     if (!g_menu.open) return;
-    static const wchar_t* const labels[Menu::ItemCount] = { L"Umbenennen", L"Löschen" };
     RectF r = RF(g_menu.rect);
     FillRound(g, RectF(r.X, r.Y + 4, r.Width, r.Height), (REAL)S(10), Color(90, 0, 0, 0));
     FillRound(g, r, (REAL)S(10), kChipHover);
     FillRound(g, RectF(r.X + 1, r.Y + 1, r.Width - 2, r.Height - 2), (REAL)S(9), Color(255, 36, 36, 36));
-    for (int i = 0; i < Menu::ItemCount; ++i) {
+    for (int i = 0; i < g_menu.count; ++i) {
         RectF item = RF(g_menu.items[i]);
         bool hover = i == g_hover.menuItem;
         if (hover) FillRound(g, item, (REAL)S(6), kChipHover);
-        Color text = i == Menu::Delete ? (hover ? kDangerHover : kDanger) : kText;
-        DrawLabel(g, labels[i], (REAL)S(14), false, text,
+        Menu::Action action = g_menu.actions[i];
+        std::wstring label;
+        Color text = kText;
+        switch (action) {
+        case Menu::Rename: label = L"Umbenennen"; break;
+        case Menu::Delete: label = L"Löschen"; text = hover ? kDangerHover : kDanger; break;
+        case Menu::RemoveFromCategory:
+            label = L"Aus „" + g_categories[g_menu.chip] + L"“ entfernen";
+            text = hover ? kDangerHover : kDanger;
+            break;
+        default: {  // sort options: the current one is marked with the accent color and its direction
+            SortKey key = SortKeyOf(action);
+            label = SortName(key);
+            if (key == g_sortKey) {
+                label += std::wstring(L"  ") + SortArrow(g_sortDescending);
+                text = kAccentHover;
+            }
+        }
+        }
+        DrawLabel(g, label, (REAL)S(14), false, text,
             RectF(item.X + S(12), item.Y, item.Width - S(24), item.Height), StringAlignmentNear, StringAlignmentCenter);
     }
 }
@@ -1479,22 +1640,57 @@ void DrawToast(Graphics& g) {
         RectF(r.X + S(22), r.Y, r.Width - S(44), r.Height), StringAlignmentNear, StringAlignmentCenter);
 }
 
+// Steam keeps the profile picture of signed-in accounts in config/avatarcache.
+void LoadAvatar() {
+    if (g_steamId.empty()) return;
+    std::error_code ec;
+    fs::path path = fs::path(SteamPath()) / L"config" / L"avatarcache" / (g_steamId + L".png");
+    if (!fs::exists(path, ec)) return;
+    Bitmap* bitmap = Bitmap::FromFile(path.c_str());
+    if (!bitmap || bitmap->GetLastStatus() != Ok) { delete bitmap; return; }
+    g_avatar = bitmap;
+}
+
+// The top bar: the Steam account and how many games the library holds in total.
+void DrawTopBar(Graphics& g) {
+    RectF bar = RF(g_L.topBar);
+    REAL avatar = (REAL)S(38), x = (REAL)S(kPanelGap + 8), cy = bar.Y + bar.Height / 2;
+    RectF circle(x, cy - avatar / 2, avatar, avatar);
+    std::wstring name = g_steamName.empty() ? L"Steam-Bibliothek" : g_steamName;
+    if (g_avatar) {
+        int size = (int)avatar;
+        if (!g_avatarBaked || g_avatarSize != size) {  // round, scaled once to the size it is drawn at
+            delete g_avatarBaked;
+            g_avatarBaked = BakeArt(g_avatar, size, size, size / 2.0f, false);
+            g_avatarSize = size;
+        }
+        g.DrawImage(g_avatarBaked, Rect((int)circle.X, (int)circle.Y, size, size));
+    } else {  // no picture in the cache: the first letter of the name
+        SolidBrush brush(kAccent);
+        g.FillEllipse(&brush, circle);
+        DrawCentered(g, name.substr(0, 1), (REAL)S(18), true, kOnAccent, circle);
+    }
+
+    REAL tx = circle.GetRight() + S(12), tw = (REAL)S(kSidebarWidth) - S(avatar / g_scale + 12);
+    DrawLabel(g, name, (REAL)S(16), true, kText, RectF(tx, cy - S(20), tw + S(200), (REAL)S(22)));
+    DrawLabel(g, std::to_wstring(g_games.size()) + (g_games.size() == 1 ? L" Spiel installiert" : L" Spiele installiert"),
+        (REAL)S(13), false, kText2, RectF(tx, cy + S(1), tw + S(200), (REAL)S(18)));
+}
+
 void DrawUi(Graphics& g, int W, int H) {
     SolidBrush window(kBar);
     g.FillRectangle(&window, 0, 0, W, H);
     FillRound(g, RF(g_L.main), (REAL)S(8), kBg);
 
+    DrawTopBar(g);
+
+    // The main panel is titled with the category that is open.
     RectF header((REAL)(g_L.main.left + S(kMargin)), (REAL)g_L.main.top, (REAL)(g_L.main.right - g_L.main.left - 2 * S(kMargin)), 0);
-    DrawLabel(g, g_steamName.empty() ? L"Deine Steam-Bibliothek" : L"Bibliothek von " + g_steamName, (REAL)S(13), true, kText2,
-        RectF(header.X, header.Y + S(16), header.Width, (REAL)S(18)));
-    DrawLabel(g, std::to_wstring(g_games.size()) + (g_games.size() == 1 ? L" Spiel" : L" Spiele"), (REAL)S(38), true, kText,
-        RectF(header.X, header.Y + S(32), header.Width, (REAL)S(48)));
-    std::wstring hint = L"Zieh ein Spiel auf eine Kategorie, um es zuzuordnen";
-    if (g_drag.active) hint = L"Lass das Spiel auf einer Kategorie los, um es zuzuordnen";
-    else if (g_categories.size() <= 1) hint = L"Lege links eine Kategorie an und zieh Spiele hinein";
-    DrawLabel(g, hint, (REAL)S(13), false, kText2, RectF(header.X, header.Y + S(82), header.Width, (REAL)S(20)));
+    DrawLabel(g, SelectedCategory(), (REAL)S(32), true, kText,
+        RectF(header.X, header.Y + S(18), header.Width - S(220), (REAL)S(46)));
 
     DrawSidebar(g);
+    DrawSortButton(g);
     DrawList(g, W);
     DrawBar(g, W, H);
     DrawToast(g);
@@ -1574,14 +1770,16 @@ void UpdateHover(HWND hwnd, POINT p) {
     next.chip = HitChip(p);
     next.cover = InPlayZone(next.row, p);
     next.sideCreate = In(g_L.create, p);
+    next.sortBtn = In(g_L.sortBtn, p);
     if (g_menu.open) {
         // The menu sits on top, so it hides whatever is underneath.
         next = Hover{};
-        for (int i = 0; i < Menu::ItemCount; ++i)
+        for (int i = 0; i < g_menu.count; ++i)
             if (In(g_menu.items[i], p)) next.menuItem = i;
     }
     bool changed = next.row != g_hover.row || next.button != g_hover.button || next.chip != g_hover.chip ||
-        next.cover != g_hover.cover || next.menuItem != g_hover.menuItem || next.sideCreate != g_hover.sideCreate;
+        next.cover != g_hover.cover || next.menuItem != g_hover.menuItem || next.sideCreate != g_hover.sideCreate ||
+        next.sortBtn != g_hover.sortBtn;
     if (!changed) return;
 
     // Repaint only what changed: the cards that lose and gain the highlight, the buttons, the chips.
@@ -1599,6 +1797,7 @@ void UpdateHover(HWND hwnd, POINT p) {
     for (int chip : { previous.chip, next.chip })
         if (chip >= 0 && chip < (int)g_L.chips.size()) touch(g_L.chips[chip], S(2));
     if (previous.sideCreate != next.sideCreate) touch(g_L.create, S(2));
+    if (previous.sortBtn != next.sortBtn) touch(g_L.sortBtn, S(2));
 }
 
 void EnsureVisible(int visibleIndex) {
@@ -1642,17 +1841,22 @@ void CloseMenu(HWND hwnd) {
     Redraw(hwnd);
 }
 
-void OpenMenu(HWND hwnd, int chip, POINT at) {
+void OpenMenu(HWND hwnd, POINT at, int chip, int game, std::initializer_list<Menu::Action> actions) {
     RECT client;
     GetClientRect(hwnd, &client);
-    int w = S(kMenuWidth), pad = S(kMenuPad), item = S(kMenuItemHeight);
-    int h = Menu::ItemCount * item + 2 * pad;
+    int w = S(game >= 0 ? kMenuWidth + 56 : kMenuWidth), pad = S(kMenuPad), item = S(kMenuItemHeight);
+    int h = (int)actions.size() * item + 2 * pad;
     int x = std::min((int)at.x, (int)client.right - w - S(8)), y = std::min((int)at.y, (int)client.bottom - h - S(8));
+    g_menu = Menu{};
     g_menu.open = true;
     g_menu.chip = chip;
+    g_menu.game = game;
     g_menu.rect = { x, y, x + w, y + h };
-    for (int i = 0; i < Menu::ItemCount; ++i)
+    for (Menu::Action action : actions) {
+        int i = g_menu.count++;
+        g_menu.actions[i] = action;
         g_menu.items[i] = { x + pad, y + pad + i * item, x + w - pad, y + pad + (i + 1) * item };
+    }
     UpdateHover(hwnd, at);
     Redraw(hwnd);
 }
@@ -1693,7 +1897,10 @@ void CommitRename(HWND hwnd) {
     }
     g_categories[g_renameChip] = name;
     for (auto& game : g_games)
-        if (game.category == old) game.category = name;
+        if (game.InCategory(old)) {
+            game.RemoveCategory(old);
+            game.AddCategory(name);
+        }
     SaveSettings();
     EndRename(hwnd, true);
 }
@@ -1716,7 +1923,7 @@ void CreateCategoryRow(HWND hwnd) {
 void DeleteCategory(HWND hwnd, int index) {
     const std::wstring name = g_categories[index];
     for (auto& game : g_games)
-        if (game.category == name) game.category = kUnsorted;
+        game.RemoveCategory(name);
     g_categories.erase(g_categories.begin() + index);
     g_active = 0;
     g_scroll = 0;
@@ -1848,10 +2055,14 @@ void EndDrag(HWND hwnd) {
 
 void DropOnCategory(HWND hwnd) {
     if (g_drag.active && g_drag.dropChip >= 1 && g_drag.row >= 0 && g_drag.row < (int)g_visible.size()) {
-        g_games[g_visible[g_drag.row]].category = g_categories[g_drag.dropChip];
+        // Dropping copies: the game stays where it is and also joins the category.
+        Game& game = g_games[g_visible[g_drag.row]];
+        const std::wstring& category = g_categories[g_drag.dropChip];
+        bool added = game.AddCategory(category);
         SaveSettings();
         EndDrag(hwnd);
         RefreshGames();
+        ShowToast(hwnd, added ? L"Zu „" + category + L"“ hinzugefügt" : L"Schon in „" + category + L"“");
     } else {
         EndDrag(hwnd);
     }
@@ -1894,14 +2105,30 @@ void OnMouseDown(HWND hwnd, UINT msg, LPARAM lp) {
     POINT p = ClientPoint(lp);
     if (g_menu.open) {
         // The menu swallows the click: pick an item, or just close it.
-        int target = g_menu.chip, picked = g_hover.menuItem;
+        Menu menu = g_menu;
+        int picked = g_hover.menuItem;
         CloseMenu(hwnd);
-        if (picked == Menu::Rename) StartRename(hwnd, target);
-        else if (picked == Menu::Delete) DeleteCategory(hwnd, target);
+        if (picked < 0 || picked >= menu.count) return;
+        switch (menu.actions[picked]) {
+        case Menu::Rename: StartRename(hwnd, menu.chip); break;
+        case Menu::Delete: DeleteCategory(hwnd, menu.chip); break;
+        case Menu::RemoveFromCategory:
+            g_games[menu.game].RemoveCategory(g_categories[menu.chip]);
+            SaveSettings();
+            RefreshGames();
+            Redraw(hwnd);
+            break;
+        default: SelectSort(hwnd, SortKeyOf(menu.actions[picked])); break;
+        }
         return;
     }
     if (In(g_L.create, p)) {
         CreateCategoryRow(hwnd);
+        return;
+    }
+    if (In(g_L.sortBtn, p)) {
+        POINT below{ g_L.sortBtn.right - S(kMenuWidth), g_L.sortBtn.bottom + S(4) };
+        OpenMenu(hwnd, below, -1, -1, { Menu::SortByName, Menu::SortByPlaytime, Menu::SortByLastPlayed, Menu::SortBySize });
         return;
     }
     int chip = HitChip(p), button = HitButton(p), row = HitRow(p);
@@ -1993,6 +2220,9 @@ void OnDestroy() {
     g_headers.Clear();
     g_portraits.Clear();
     ClearBaked();
+    delete g_avatar;
+    delete g_avatarBaked;
+    g_avatar = g_avatarBaked = nullptr;
     PostQuitMessage(0);
 }
 
@@ -2071,9 +2301,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_RBUTTONUP: {
         POINT p = ClientPoint(lp);
-        int chip = HitChip(p);
+        int chip = HitChip(p), row = HitRow(p);
         CloseMenu(hwnd);
-        if (chip >= 1) OpenMenu(hwnd, chip, p);  // the first chip, "Alle Spiele", is built in
+        if (chip >= 1) {
+            OpenMenu(hwnd, p, chip, -1, { Menu::Rename, Menu::Delete });  // "Alle Spiele", the first row, is built in
+        } else if (row >= 0 && g_active >= 1) {
+            // A game inside a category can be taken out of it again; it stays in the library and other categories.
+            OpenMenu(hwnd, p, g_active, g_visible[row], { Menu::RemoveFromCategory });
+        }
         return 0;
     }
 
@@ -2142,7 +2377,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     CreateDirectoryW(g_coverDir.c_str(), nullptr);
     LoadSettings();
     LoadTypes();
-    g_steamName = SteamPersonaName();
+    LoadSteamUser();
+    LoadAvatar();
     MergeGames(ScanSteamGames());
 
     const wchar_t className[] = L"SteamGameRandomizerWindow";
