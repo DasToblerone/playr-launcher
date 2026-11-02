@@ -48,10 +48,6 @@ Die Releases sind noch nicht mit einem Zertifikat signiert. Windows' Smart App C
 
 Das Tool sendet keine persönlichen Daten und hat keine Telemetrie. Es liest nur Dateien von Steam auf deinem Rechner und fragt Steams öffentliche Server nach Titelbildern und danach, ob eine App ein Spiel ist. Details stehen in [CODE_SIGNING.md](CODE_SIGNING.md).
 
-## Lizenz
-
-[MIT](LICENSE)
-
 ## Bauen
 
 Windows, Visual Studio mit C++-Werkzeugen (Developer Command Prompt):
