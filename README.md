@@ -15,6 +15,33 @@ Eine kleine Windows-App, die deine installierten Steam-Spiele als Bibliothek zei
 
 Geschrieben in C++ mit der Win32-API und GDI+, ohne weitere Abhängigkeiten. Einstellungen und Bilder liegen unter `%APPDATA%\PLAYR-Launcher`. Die App liest Steams Dateien nur und schreibt nur in diesen Ordner.
 
+## Aus dem Quellcode bauen
+
+Voraussetzung sind die „Build Tools für Visual Studio“ mit dem Workload „Desktopentwicklung mit C++“ (enthält CMake und Ninja). In der „x64 Native Tools Command Prompt für VS“:
+
+```
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+Die fertige `PLAYR-Launcher.exe` liegt danach in `build`.
+
+## Projektstruktur
+
+```
+src/
+  main.cpp      Einstiegspunkt
+  app/          Nachrichten der Hintergrundthreads ans Fenster
+  model/        Spiel, Kategorien, Sortierung
+  steam/        Steam-Dateien lesen: Bibliotheken, Spielzeit, Sammlungen
+  storage/      Einstellungen und Caches unter %APPDATA%
+  net/          HTTP und Steam-Store-Abfragen (Cover, Spiele erkennen)
+  ui/           Fenster, Layout, Zeichnen mit GDI+, Eingabe
+  util/         Text, VDF/JSON-Parser
+  platform/     Win32- und GDI+-Header
+resources/      Icon und Ressourcendatei
+```
+
 ## Datenschutz
 
 Die App hat keinen Server, kein Konto und keine Telemetrie, der Entwickler erhält keine Daten. Für Titelbilder und Spielinformationen ruft sie den Steam-Store und das Steam-CDN ab, dabei sehen deren Betreiber deine IP-Adresse und die App-IDs deiner Spiele. Details stehen in der [Datenschutzerklärung](PRIVACY.md).

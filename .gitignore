@@ -4,3 +4,4 @@
 *.obj
 *.png
 !screenshots/*.png
+build/
