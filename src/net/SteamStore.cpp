@@ -1,5 +1,6 @@
 #include "net/SteamStore.h"
 
+#include <algorithm>
 #include <set>
 
 #include "app/Messages.h"
@@ -96,7 +97,7 @@ bool IsGameJson(const std::string& json) {
 
 // Asks the store whether an app is a game. Failed requests are not cached, so they are retried next start.
 void ClassifyApp(const std::wstring& appId) {
-    Sleep(300);  // stay well below the store API's rate limit
+    Sleep(250);  // with three threads this is a few requests per second, below the store API's rate limit
     std::string json = StoreDetails(appId, L"basic,genres");
     if (json.empty()) return;
     PostMessageW(g_mainWnd, WM_CLASSIFIED, (WPARAM)wcstoull(appId.c_str(), nullptr, 10), IsGameJson(json) ? 1 : 0);
@@ -104,7 +105,7 @@ void ClassifyApp(const std::wstring& appId) {
 
 // Looks up an app the account owns but has not installed: its name, and whether it is a game at all.
 void ResolveOwnedApp(const std::wstring& appId) {
-    Sleep(300);
+    Sleep(250);
     std::string json = StoreDetails(appId, L"basic,genres");
     if (json.empty()) return;
 
@@ -124,25 +125,34 @@ void ResolveOwnedApp(const std::wstring& appId) {
 
 }  // namespace
 
-WorkQueue g_coverQueue(DownloadCover);
+WorkQueue g_coverQueue(DownloadCover, 6);  // the CDN has no rate limit, so several images load at once
 
 namespace {
 
-WorkQueue g_classifyQueue(ClassifyApp);
-WorkQueue g_ownedQueue(ResolveOwnedApp);
+// The store API limits the request rate, so these run on a few threads with a short pause each.
+WorkQueue g_classifyQueue(ClassifyApp, 3);
+WorkQueue g_ownedQueue(ResolveOwnedApp, 3);
 
 }  // namespace
 
 void QueueBackgroundWork() {
-    std::vector<std::wstring> covers, unknown, owned;
+    std::vector<std::wstring> unknown, owned;
+    std::vector<const Game*> needArt;
     std::set<std::wstring> known;
     for (const auto& game : g_games) {
         known.insert(game.appId);
         std::error_code ec;
-        if (!fs::exists(CoverPath(game.appId), ec) || !fs::exists(PortraitPath(game.appId), ec))
-            covers.push_back(game.appId);
+        if (!fs::exists(CoverPath(game.appId), ec) || !fs::exists(PortraitPath(game.appId), ec)) needArt.push_back(&game);
         if (!g_isGame.count(game.appId)) unknown.push_back(game.appId);
     }
+    // On the first start the games you see first should get their pictures first: installed games, most recent on top.
+    std::stable_sort(needArt.begin(), needArt.end(), [](const Game* a, const Game* b) {
+        if (a->installed != b->installed) return a->installed;
+        return a->lastPlayed > b->lastPlayed;
+    });
+    std::vector<std::wstring> covers;
+    for (const Game* game : needArt) covers.push_back(game->appId);
+
     for (const auto& id : FindOwnedCandidates()) {
         auto verdict = g_isGame.find(id);
         if (!known.count(id) && !g_ownedNames.count(id) && (verdict == g_isGame.end() || verdict->second)) owned.push_back(id);
