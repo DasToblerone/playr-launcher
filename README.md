@@ -17,14 +17,27 @@ Geschrieben in C++ mit der Win32-API und GDI+, ohne weitere Abhängigkeiten. Ein
 
 ## Aus dem Quellcode bauen
 
-Voraussetzung sind die „Build Tools für Visual Studio“ mit dem Workload „Desktopentwicklung mit C++“ (enthält CMake und Ninja). In der „x64 Native Tools Command Prompt für VS“:
+Du brauchst keine Programmierkenntnisse, nur Windows 10/11 (64 Bit) und etwa 10 Minuten.
 
-```
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
+1. **Compiler installieren** (einmalig, etwa 3 GB). Drücke die Windows-Taste, tippe `cmd`, öffne die Eingabeaufforderung und füge diesen Befehl ein:
+   ```
+   winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+   ```
+   Bestätige die Windows-Rückfrage mit „Ja“ und warte, bis das Fenster fertig ist. Das enthält auch CMake und Ninja. Ohne `winget` geht es auch von Hand: die „Build Tools für Visual Studio“ von [visualstudio.microsoft.com](https://visualstudio.microsoft.com/downloads/) laden und den Workload „Desktopentwicklung mit C++“ ankreuzen.
+2. **Quellcode holen:** Auf GitHub oben rechts „Code“ → „Download ZIP“ und die ZIP-Datei entpacken, zum Beispiel nach `C:\playr-launcher`. Mit Git geht auch `git clone https://github.com/DasToblerone/playr-launcher`.
+3. **Richtige Eingabeaufforderung öffnen:** Windows-Taste drücken, `x64 Native Tools` tippen und „x64 Native Tools Command Prompt for VS 2022“ öffnen. Die normale Eingabeaufforderung reicht hier nicht, denn nur diese kennt den Compiler.
+4. **In den Ordner wechseln.** Bei einem anderen Ordner den Pfad anpassen; liegt er auf einem anderen Laufwerk, zuerst dessen Buchstaben eingeben, zum Beispiel `D:`:
+   ```
+   cd C:\playr-launcher
+   ```
+5. **Bauen:** Diese beiden Befehle nacheinander eingeben, der zweite braucht etwa eine halbe Minute:
+   ```
+   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+   cmake --build build
+   ```
+6. **Fertig:** Die Datei `PLAYR-Launcher.exe` liegt jetzt im Unterordner `build`. Ein Doppelklick startet sie.
 
-Die fertige `PLAYR-Launcher.exe` liegt danach in `build`.
+Kommt „cmake wird nicht erkannt“, wurde nicht die Eingabeaufforderung aus Schritt 3 benutzt, oder die Installation aus Schritt 1 ist nicht fertig. Wenn der Bau mit einer Fehlermeldung abbricht, hilft ein [Issue](https://github.com/DasToblerone/playr-launcher/issues) mit dem Text der Meldung.
 
 ## Projektstruktur
 
