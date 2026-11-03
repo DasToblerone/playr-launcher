@@ -1,6 +1,6 @@
-// Steam Game Randomizer
+// PLAYR-Launcher
 //
-// Picks a random installed Steam game, or the one you click. Games are read from the local Steam
+// Lists your installed Steam games, launches the one you click, or picks one at random. Games are read from the local Steam
 // libraries, cover art comes from Steam's CDN, and everything is drawn with GDI+ in a dark
 // Spotify-like style with a purple accent.
 
@@ -566,7 +566,7 @@ bool HttpGet(const std::wstring& url, Sink sink) {
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts)) return false;
     std::wstring target = std::wstring(path) + std::wstring(parts.lpszExtraInfo, parts.dwExtraInfoLength);
 
-    HINTERNET session = WinHttpOpen(L"GameRandomizer/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    HINTERNET session = WinHttpOpen(L"PLAYR-Launcher/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) return false;
     WinHttpSetTimeouts(session, 5000, 5000, 10000, 10000);
@@ -2846,8 +2846,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     g_scale = GetDeviceCaps(screen, LOGPIXELSX) / 96.0f;
     ReleaseDC(nullptr, screen);
 
-    g_dataDir = KnownFolder(FOLDERID_RoamingAppData) + L"\\GameRandomizer";
+    g_dataDir = KnownFolder(FOLDERID_RoamingAppData) + L"\\PLAYR-Launcher";
     g_coverDir = g_dataDir + L"\\covers";
+    {   // the app used to be called GameRandomizer: take over its settings and covers
+        std::error_code ec;
+        fs::path legacy = fs::path(KnownFolder(FOLDERID_RoamingAppData)) / L"GameRandomizer";
+        if (fs::exists(legacy, ec) && !fs::exists(g_dataDir, ec)) fs::rename(legacy, g_dataDir, ec);
+    }
     CreateDirectoryW(g_dataDir.c_str(), nullptr);
     CreateDirectoryW(g_coverDir.c_str(), nullptr);
     LoadSettings();
@@ -2857,7 +2862,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     LoadAvatar();
     MergeGames(ScanSteamGames());
 
-    const wchar_t className[] = L"SteamGameRandomizerWindow";
+    const wchar_t className[] = L"PlayrLauncherWindow";
     WNDCLASSW wc{};
     wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = WindowProc;
@@ -2874,7 +2879,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + std::max(0, (int)(work.right - work.left - width) / 2);
     int y = work.top + std::max(0, (int)(work.bottom - work.top - height) / 2);
-    HWND hwnd = CreateWindowExW(0, className, L"Steam Game Randomizer", WINDOW_STYLE, x, y, width, height,
+    HWND hwnd = CreateWindowExW(0, className, L"PLAYR-Launcher", WINDOW_STYLE, x, y, width, height,
         nullptr, nullptr, instance, nullptr);
     if (!hwnd) {
         GdiplusShutdown(gdiToken);

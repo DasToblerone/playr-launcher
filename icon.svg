@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <title>Steam Game Randomizer</title>
+  <title>PLAYR-Launcher</title>
   <rect width="256" height="256" rx="56" fill="#121212"/>
   <g transform="rotate(-10 128 128)">
     <rect x="48" y="48" width="160" height="160" rx="36" fill="#A855F7"/>
