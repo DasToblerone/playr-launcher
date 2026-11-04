@@ -61,6 +61,7 @@ Die App hat keinen Server, kein Konto und keine Telemetrie, der Entwickler erhä
 
 ## Hinweise
 
+- **KI-generiert:** Der Quellcode, die Oberfläche, die Dokumentation und die Screenshot-Demodaten dieses Projekts wurden mit Hilfe von KI erstellt (Claude von Anthropic) und von DasToblerone angeleitet und geprüft. Die Commits tragen entsprechende `Co-Authored-By`-Zeilen. Wie bei jeder Software können Fehler vorkommen, Rückmeldungen sind willkommen.
 - PLAYR-Launcher ist ein unabhängiges Projekt und steht in keiner Verbindung zu Valve. „Steam“ ist eine Marke der Valve Corporation, Titelbilder und Spielnamen gehören ihren jeweiligen Inhabern. Die Bilder werden zur Laufzeit von Steam geladen und nicht mit der App verteilt.
 - Die fertige `.exe` ist nicht signiert. Windows SmartScreen oder dein Virenscanner können deshalb warnen.
 - Lizenz: [MIT](LICENSE). Das Projekt ist kostenlos, quelloffen und nicht kommerziell. Fragen und Fehler gern als [Issue](https://github.com/DasToblerone/playr-launcher/issues).
