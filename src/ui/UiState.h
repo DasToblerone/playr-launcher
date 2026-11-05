@@ -8,10 +8,19 @@
 
 namespace playr {
 
+// A filter chip of the randomizer: group 0 is the play-time filter, group 1 the collection to draw from.
+struct ChipHit {
+    RECT r{};
+    int group = 0, value = 0;
+    std::wstring label;
+};
+
 struct Layout {
+    RECT tab[2]{};               // "Würfeln" and "Bibliothek" in the top bar
+    int toastBottom = 0;         // the toast sits above this line
     RECT list{};
     RECT bar{};
-    RECT btn[BTN_COUNT]{};
+    RECT btn[BTN_COUNT]{};       // library: the bottom bar; randomizer: scan and import in the top bar
     RECT sidebar{}, main{}, sideList{}, create{};  // create: "+ Erstellen" in the sidebar header
     RECT topBar{};
     RECT search{}, searchClear{};  // the search field in the top bar and its "x"
@@ -23,6 +32,16 @@ struct Layout {
     int wheelStep = 0;
     bool grid = false;
     int cols = 1, cellW = 0, cellH = 0, cardGap = 0, cardPad = 0, artW = 0, artH = 0;
+
+    // The randomizer page.
+    RECT panel{};
+    RECT rollToggle{};           // switch for the games that are not installed
+    std::vector<ChipHit> rollChips;
+    int labelX = 0, labelY[2]{ -1, -1 }, labelH = 0;  // the "Spielzeit" and "Sammlung" captions in front of the chips
+    RECT stage{};                // everything below the filters: the reel and the result
+    RECT reel{};
+    int reelCardW = 0, reelCardH = 0, centerX = 0, centerY = 0;
+    RECT name{}, stats{}, act[ACT_COUNT]{};
 };
 
 struct Hover {
@@ -33,8 +52,12 @@ struct Hover {
     bool sortBtn = false;
     bool searchClear = false;
     bool toggle = false;
+    // The randomizer page and the tabs.
+    int tab = -1, rollChip = -1, action = -1;
+    bool rollToggle = false, card = false;
     bool Any() const {
-        return row >= 0 || button >= 0 || chip >= 0 || menuItem >= 0 || sideCreate || sortBtn || searchClear || toggle;
+        return row >= 0 || button >= 0 || chip >= 0 || menuItem >= 0 || sideCreate || sortBtn || searchClear || toggle ||
+            tab >= 0 || rollChip >= 0 || action >= 0 || rollToggle || card;
     }
 };
 
@@ -51,7 +74,7 @@ struct Menu {
     RECT items[kMaxItems]{};
 };
 
-// A short message above the bottom bar.
+// A short message at the bottom of the page.
 struct Toast {
     bool active = false;
     std::wstring text;
@@ -78,6 +101,7 @@ extern Gdiplus::Bitmap* g_avatar;        // the Steam profile picture
 extern Gdiplus::Bitmap* g_avatarBaked;   // it, round and scaled for the top bar
 extern int g_avatarSize;
 
+extern Page g_page;                 // which tab is open
 extern float g_scale;
 extern Layout g_L;
 extern Hover g_hover;

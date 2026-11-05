@@ -18,4 +18,4 @@ set_target_properties(playr-launcher PROPERTIES OUTPUT_NAME "PLAYR-Launcher")
 target_include_directories(playr-launcher PRIVATE src)
 target_compile_options(playr-launcher PRIVATE /utf-8 /EHsc /W3)
 target_link_libraries(playr-launcher PRIVATE
-    user32 gdi32 advapi32 shell32 ole32 gdiplus winhttp dwmapi comctl32)
+    user32 gdi32 advapi32 shell32 ole32 gdiplus winhttp dwmapi comctl32 winmm)

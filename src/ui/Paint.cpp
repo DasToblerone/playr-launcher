@@ -9,25 +9,49 @@ namespace playr {
 
 namespace {
 
+RECT g_dirty{};  // the part of the window that is being repainted
+
+// Parts of the window outside the repainted area are skipped: GDI+ clips them, but it still lays out their text and
+// builds their paths first, which adds up when only the list or the reel changed.
+bool Needs(const RECT& area) {
+    RECT overlap;
+    return IntersectRect(&overlap, &area, &g_dirty) != 0;
+}
+
 void DrawUi(Graphics& g, int W, int H) {
     SolidBrush window(kBar);
     g.FillRectangle(&window, 0, 0, W, H);
-    FillRound(g, RF(g_L.main), (REAL)S(8), kBg);
+    bool library = g_page == Page::Library;
+    FillRound(g, RF(library ? g_L.main : g_L.panel), (REAL)S(8), kBg);
 
-    DrawTopBar(g);
-    DrawSearchField(g);
-    DrawCaptionButtons(g);
+    if (Needs(g_L.topBar)) {
+        DrawTopBar(g);
+        DrawTabs(g);
+        DrawCaptionButtons(g);
+    }
 
-    // The main panel is titled with the category that is open.
-    RectF header((REAL)(g_L.main.left + S(kMargin)), (REAL)g_L.main.top, (REAL)(g_L.main.right - g_L.main.left - 2 * S(kMargin)), 0);
-    DrawLabel(g, SelectedCategory(), (REAL)S(32), true, kText,
-        RectF(header.X, header.Y + S(18), (REAL)(g_L.toggle.left - S(24) - (int)header.X), (REAL)S(46)));
+    if (!library) {
+        if (Needs(g_L.topBar)) DrawActionButtons(g);
+        RECT filters{ g_L.panel.left, g_L.panel.top, g_L.panel.right, g_L.stage.top };
+        if (Needs(filters)) DrawFilters(g);
+        if (Needs(g_L.stage)) DrawStage(g);
+        DrawToast(g);
+        return;
+    }
 
-    DrawSidebar(g);
-    DrawSortButton(g);
-    DrawUninstalledToggle(g);
-    DrawList(g, W);
-    DrawBar(g, W, H);
+    if (Needs(g_L.topBar)) DrawSearchField(g);
+    RECT header{ g_L.main.left, g_L.main.top, g_L.main.right, g_L.list.top };
+    if (Needs(header)) {
+        // The main panel is titled with the category that is open.
+        RectF title((REAL)(g_L.main.left + S(kMargin)), (REAL)g_L.main.top, (REAL)(g_L.main.right - g_L.main.left - 2 * S(kMargin)), 0);
+        DrawLabel(g, SelectedCategory(), (REAL)S(32), true, kText,
+            RectF(title.X, title.Y + S(18), (REAL)(g_L.toggle.left - S(24) - (int)title.X), (REAL)S(46)));
+        DrawSortButton(g);
+        DrawUninstalledToggle(g);
+    }
+    if (Needs(g_L.sidebar)) DrawSidebar(g);
+    if (Needs(g_L.list)) DrawList(g, W);
+    if (Needs(g_L.bar)) DrawBar(g, W, H);
     DrawToast(g);
     DrawMenu(g);
     DrawDragGhost(g);
@@ -37,6 +61,8 @@ void DrawUi(Graphics& g, int W, int H) {
 
 void Paint(HWND hwnd) {
     PAINTSTRUCT ps;
+    HRGN updateRegion = CreateRectRgn(0, 0, 0, 0);
+    int updateKind = GetUpdateRgn(hwnd, updateRegion, FALSE);
     HDC hdc = BeginPaint(hwnd, &ps);
     RECT rc;
     GetClientRect(hwnd, &rc);
@@ -58,7 +84,10 @@ void Paint(HWND hwnd) {
         {
             Graphics g(mem);
             const RECT& dirty = ps.rcPaint;
-            g.SetClip(Rect(dirty.left, dirty.top, dirty.right - dirty.left, dirty.bottom - dirty.top));
+            g_dirty = dirty;
+            // The real update region, not just its bounding box: two small areas far apart stay two small areas.
+            if (updateKind == COMPLEXREGION) { Region region(updateRegion); g.SetClip(&region); }
+            else g.SetClip(Rect(dirty.left, dirty.top, dirty.right - dirty.left, dirty.bottom - dirty.top));
             g.SetSmoothingMode(SmoothingModeAntiAlias);
             g.SetPixelOffsetMode(PixelOffsetModeHalf);
             g.SetInterpolationMode(InterpolationModeBilinear);
@@ -69,6 +98,7 @@ void Paint(HWND hwnd) {
             ps.rcPaint.bottom - ps.rcPaint.top, mem, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
     }
     EndPaint(hwnd, &ps);
+    DeleteObject(updateRegion);
 }
 
 }  // namespace playr

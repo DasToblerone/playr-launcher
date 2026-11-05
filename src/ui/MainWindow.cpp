@@ -13,6 +13,7 @@
 #include "ui/HitTest.h"
 #include "ui/Input.h"
 #include "ui/Layout.h"
+#include "ui/Randomizer.h"
 #include "ui/UiState.h"
 
 using namespace Gdiplus;
@@ -52,6 +53,7 @@ void OnCreate(HWND hwnd) {
     DwmSetWindowAttribute(hwnd, 36 /* DWMWA_TEXT_COLOR */, &captionText, sizeof(captionText));
     CreateEditControls(hwnd);
     RefreshGames();
+    RebuildPool(true);
 }
 
 void OnDestroy() {
@@ -111,7 +113,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         // The empty part of the top bar moves the window; the search field and the avatar area stay clickable.
-        if (In(g_L.topBar, p) && !In(g_L.search, p)) return HTCAPTION;
+        if (In(g_L.topBar, p) && !In(g_L.search, p) && HitTab(p) < 0 && HitButton(p) < 0) return HTCAPTION;
         return HTCLIENT;
     }
 
@@ -183,6 +185,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_MOUSEWHEEL: {
+        if (g_page != Page::Library) return 0;
         CloseMenu(hwnd);
         POINT p;
         GetCursorPos(&p);
@@ -190,13 +193,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
         if (In(g_L.sidebar, p)) {
             g_sideScroll -= delta * S(kSideRow) / WHEEL_DELTA;
-            Relayout(hwnd);  // moves the rows
+            ClampSideScroll();
+            if (g_renameChip >= 0) {
+                Relayout(hwnd);  // the rename field has to move with its row
+            } else {
+                LayoutSideRows();  // moves the rows; only the sidebar is repainted
+                InvalidateRect(hwnd, &g_L.sidebar, FALSE);
+            }
         } else {
             g_scroll -= delta * g_L.wheelStep / WHEEL_DELTA;
             ClampScroll();
+            InvalidateRect(hwnd, &g_L.list, FALSE);  // only the list is repainted
         }
         UpdateHover(hwnd, p);
-        Redraw(hwnd);
         return 0;
     }
 
@@ -210,6 +219,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_RBUTTONUP: {
+        if (g_page != Page::Library) return 0;
         POINT p = ClientPoint(lp);
         int chip = HitChip(p), row = HitRow(p);
         CloseMenu(hwnd);
@@ -245,13 +255,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (id - ID_ACTION) {
         case BTN_SCAN: Rescan(hwnd); return 0;
         case BTN_IMPORT: ImportFromSteam(hwnd); return 0;
-        case BTN_RANDOM: SelectRandomGame(hwnd); return 0;
         }
         break;
     }
 
     case WM_TIMER:
         if (wp == TIMER_ANIMATION) TickBadges(hwnd);
+        else if (wp == TIMER_SPIN) TickSpin(hwnd);
         return 0;
 
     case WM_COVER:

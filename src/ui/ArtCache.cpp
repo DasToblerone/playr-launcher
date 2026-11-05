@@ -52,12 +52,12 @@ ArtCache g_headers, g_portraits;
 Bitmap* GetCover(const std::wstring& appId) { return g_headers.Get(appId, CoverPath(appId)); }
 Bitmap* GetPortrait(const std::wstring& appId) { return g_portraits.Get(appId, PortraitPath(appId)); }
 
-BakedCache g_bakedRows, g_bakedCards, g_bakedTilesSmall, g_bakedTilesFull;
+BakedCache g_bakedRows, g_bakedCards, g_bakedTilesSmall, g_bakedTilesFull, g_bakedReel;
 
 namespace {
 
 void ForgetBaked(unsigned long long id) {
-    for (BakedCache* cache : { &g_bakedRows, &g_bakedCards, &g_bakedTilesSmall, &g_bakedTilesFull }) {
+    for (BakedCache* cache : { &g_bakedRows, &g_bakedCards, &g_bakedTilesSmall, &g_bakedTilesFull, &g_bakedReel }) {
         auto it = cache->find(id);
         if (it == cache->end()) continue;
         delete it->second.bitmap;
@@ -66,7 +66,7 @@ void ForgetBaked(unsigned long long id) {
 }
 
 void ClearBaked() {
-    for (BakedCache* cache : { &g_bakedRows, &g_bakedCards, &g_bakedTilesSmall, &g_bakedTilesFull }) {
+    for (BakedCache* cache : { &g_bakedRows, &g_bakedCards, &g_bakedTilesSmall, &g_bakedTilesFull, &g_bakedReel }) {
         for (auto& entry : *cache) delete entry.second.bitmap;
         cache->clear();
     }

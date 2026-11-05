@@ -9,8 +9,9 @@
 
 namespace playr {
 
-void LaunchGame(HWND hwnd, const Game& game);
-void SelectRandomGame(HWND hwnd);
+// Starts an installed game (and closes the window), or opens Steam's install dialog for one that is not installed.
+void ActivateGame(HWND hwnd, const Game& game);
+void LaunchGame(HWND hwnd, const Game& game);  // library: only installed games
 void ImportFromSteam(HWND hwnd);
 void Rescan(HWND hwnd);
 

@@ -70,23 +70,21 @@ void DrawSortButton(Graphics& g) {
     DrawButtonContent(g, r, Icon::Sort, std::wstring(SortName(g_sortKey)) + L"  " + SortArrow(g_sortDescending), kText);
 }
 
-void DrawBar(Graphics& g, int W, int H) {
-    SolidBrush bar(kBar);
-    g.FillRectangle(&bar, 0, (INT)g_L.bar.top, W, H - (INT)g_L.bar.top);
-
+// "Neu scannen" and "Steam-Sammlungen": in the bottom bar of the library, in the top bar of the randomizer.
+void DrawActionButtons(Graphics& g) {
     for (int i = 0; i < BTN_COUNT; ++i) {
         RectF r = RF(g_L.btn[i]);
-        bool hover = i == g_hover.button;
-        if (i == BTN_RANDOM) {
-            FillRound(g, r, r.Height / 2, hover ? kAccentHover : kAccent);
-            DrawCentered(g, kButtonLabels[i], (REAL)S(14), true, kOnAccent, r);
-            continue;
-        }
         bool busy = g_badge[i].mode != Badge::Off;
-        FillRound(g, r, r.Height / 2, hover && !busy ? kChipHover : kSurface);
+        FillRound(g, r, r.Height / 2, g_hover.button == i && !busy ? kChipHover : kSurface);
         if (busy) DrawBadge(g, r, g_badge[i]);
         else DrawButtonContent(g, r, kButtonIcons[i], kButtonLabels[i], kText);
     }
+}
+
+void DrawBar(Graphics& g, int W, int H) {
+    SolidBrush bar(kBar);
+    g.FillRectangle(&bar, 0, (INT)g_L.bar.top, W, H - (INT)g_L.bar.top);
+    DrawActionButtons(g);
 }
 
 }  // namespace playr

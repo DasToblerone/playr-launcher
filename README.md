@@ -1,17 +1,22 @@
 # PLAYR-Launcher
 
-Eine kleine Windows-App, die deine installierten Steam-Spiele als Bibliothek zeigt. Du startest ein Spiel mit einem Klick oder lässt dir eins vorschlagen. Die Oberfläche ist an einen dunklen Musik-Player mit Playlists angelehnt.
+Ein Zufallsgenerator für deine Steam-Spiele, mit der alten Bibliothek als zweitem Tab. Du weißt nicht, was du spielen sollst? Ein Klick auf „Würfeln“, ein Cover-Streifen läuft durch und bleibt bei einem Spiel stehen. Mit „Starten“ geht es direkt los.
 
-![Listenansicht](screenshots/liste.png)
+![Würfeln](screenshots/wuerfeln.png)
 
-![Kartenansicht](screenshots/karten.png)
+![Bibliothek als Liste](screenshots/liste.png)
 
-*Screenshots von Version 1.6.0 mit Demodaten und erfundenen Spielen.*
+![Bibliothek als Karten](screenshots/karten.png)
 
-- Liest die installierten Spiele aus allen Steam-Bibliotheken, mit Titelbild, Spielzeit, zuletzt gespielt, Größe und Erfolgsfortschritt
-- Zeigt auch Spiele, die du besitzt, aber nicht installiert hast, grau und ohne Start-Button
-- Eigene Kategorien wie Playlists, auch aus deinen Steam-Sammlungen importierbar
-- Suche, Sortieren, Listen- und Kartenansicht, zufälliges Spiel auswählen
+*Screenshots von Version 1.7.0 mit Platzhalter-Daten und erfundenen Spielen.*
+
+- Würfelt aus allen Spielen, die Steam auf deinem PC kennt, mit Titelbild, Spielzeit, zuletzt gespielt, Größe und Erfolgsfortschritt
+- Filter, was gewürfelt werden darf: nie gespielt, unter 2 Stunden, lange nicht gespielt, dazu deine Steam-Sammlungen als Topf
+- Nicht installierte Spiele lassen sich dazunehmen; kommt eines, öffnet „Installieren“ Steams Installationsdialog
+- Die letzten Gewinner kommen so schnell nicht wieder dran
+- Der Spin klickt für jedes Cover, das vorbeiläuft, und endet mit einem kurzen Klang (alles im Programm erzeugt, mit M ausschaltbar)
+- Zweiter Tab „Bibliothek“: alle Spiele als Liste oder Karten, mit Suche, Sortierung, eigenen Kategorien (auch aus Steam-Sammlungen) und Drag-and-drop
+- Bedienung per Maus oder Tastatur: Leertaste würfelt, Enter startet das Spiel, F11 Vollbild
 
 Geschrieben in C++ mit der Win32-API und GDI+, ohne weitere Abhängigkeiten. Einstellungen und Bilder liegen unter `%APPDATA%\PLAYR-Launcher`. Die App liest Steams Dateien nur und schreibt nur in diesen Ordner.
 
@@ -45,11 +50,11 @@ Kommt „cmake wird nicht erkannt“, wurde nicht die Eingabeaufforderung aus Sc
 src/
   main.cpp      Einstiegspunkt
   app/          Nachrichten der Hintergrundthreads ans Fenster
-  model/        Spiel, Kategorien, Sortierung
+  model/        Spiel und Sammlungen
   steam/        Steam-Dateien lesen: Bibliotheken, Spielzeit, Sammlungen
   storage/      Einstellungen und Caches unter %APPDATA%
   net/          HTTP und Steam-Store-Abfragen (Cover, Spiele erkennen)
-  ui/           Fenster, Layout, Zeichnen mit GDI+, Eingabe
+  ui/           Fenster, Würfel-Logik (Randomizer), Layout, Zeichnen mit GDI+, Eingabe
   util/         Text, VDF/JSON-Parser
   platform/     Win32- und GDI+-Header
 resources/      Icon und Ressourcendatei

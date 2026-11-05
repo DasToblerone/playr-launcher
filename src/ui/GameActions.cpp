@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <memory>
-#include <random>
 #include <thread>
 
 #include "app/Messages.h"
@@ -11,56 +10,47 @@
 #include "storage/Storage.h"
 #include "ui/Feedback.h"
 #include "ui/Layout.h"
+#include "ui/Randomizer.h"
 #include "ui/UiState.h"
 
 namespace playr {
 
-void LaunchGame(HWND hwnd, const Game& game) {
-    if (!game.installed) return;
-    std::wstring uri = L"steam://rungameid/" + game.appId;
-    HINSTANCE result = ShellExecuteW(hwnd, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    if ((INT_PTR)result <= 32)
-        ShowToast(hwnd, L"Steam konnte das Spiel nicht starten");
-    else
-        DestroyWindow(hwnd);
+namespace {
+
+bool OpenSteamUri(HWND hwnd, const std::wstring& uri) {
+    return (INT_PTR)ShellExecuteW(hwnd, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL) > 32;
 }
 
-// Selects a random game of the current category, different from the current selection. Starting is up to the user.
-void SelectRandomGame(HWND hwnd) {
-    if (g_visible.empty()) {
-        ShowToast(hwnd, L"In dieser Kategorie sind keine Spiele");
-        return;
-    }
-    // Only installed games can be played, so only they are picked.
-    std::vector<int> choices, installed;
-    for (int i = 0; i < (int)g_visible.size(); ++i) {
-        if (!g_games[g_visible[i]].installed) continue;
-        installed.push_back(i);
-        if (g_visible[i] != g_sel) choices.push_back(i);
-    }
-    if (installed.empty()) {
-        ShowToast(hwnd, L"In dieser Kategorie ist kein Spiel installiert");
-        return;
-    }
-    if (choices.empty()) choices = installed;
+}  // namespace
 
-    std::random_device rd;
-    std::mt19937 rng(rd());
-    int index = choices[std::uniform_int_distribution<size_t>(0, choices.size() - 1)(rng)];
-    g_sel = g_visible[index];
-    EnsureVisible(index);
-    Redraw(hwnd);
+// Starts an installed game and closes the window (the job is done); a game that is not installed opens Steam's
+// install dialog instead, and the window stays.
+void ActivateGame(HWND hwnd, const Game& game) {
+    if (game.installed) {
+        if (OpenSteamUri(hwnd, L"steam://rungameid/" + game.appId)) DestroyWindow(hwnd);
+        else ShowToast(hwnd, L"Steam konnte das Spiel nicht starten");
+    } else if (OpenSteamUri(hwnd, L"steam://install/" + game.appId)) {
+        ShowToast(hwnd, L"Steam öffnet die Installation");
+    } else {
+        ShowToast(hwnd, L"Steam konnte nicht geöffnet werden");
+    }
+}
+
+// Library: starting is for installed games only.
+void LaunchGame(HWND hwnd, const Game& game) {
+    if (game.installed) ActivateGame(hwnd, game);
 }
 
 void ImportFromSteam(HWND hwnd) {
     if (g_badge[BTN_IMPORT].mode == Badge::Spinner) return;
     ImportResult result = ImportSteamCategories();
     if (result.games > 0) {
-        SaveSettings();
         RefreshGames();
-        Relayout(hwnd);
+        RebuildPool(false);
+        RebuildPool(false);
+        Relayout(hwnd);  // new collections add chips
         g_importResult = { Badge::Check,
-            std::to_wstring(result.categories) + (result.categories == 1 ? L" Kategorie" : L" Kategorien"), 0, 2200 };
+            std::to_wstring(result.categories) + (result.categories == 1 ? L" Sammlung" : L" Sammlungen"), 0, 2200 };
     } else {
         g_importResult = { Badge::Text, L"Nichts Neues", 0, 2200 };
     }
@@ -84,6 +74,7 @@ void OnScanDone(HWND hwnd, std::map<std::wstring, Game>* found) {
     if (g_active >= (int)g_categories.size()) g_active = 0;
     g_sel = -1;
     RefreshGames();
+    RebuildPool(true);
     Relayout(hwnd);
     QueueBackgroundWork();
     g_scanReady = true;
@@ -111,6 +102,7 @@ void OnOwned(HWND hwnd, OwnedResult* raw) {
         if (!selected.empty() && g_games[i].appId == selected) g_sel = i;
     g_coverQueue.Push({ result->appId });
     RefreshGames();
+    RebuildPool(false);  // the reel and the result go by app id, so a running spin is not disturbed
     Relayout(hwnd);
 }
 
@@ -123,6 +115,7 @@ void OnClassified(HWND hwnd, const std::wstring& appId, bool isGame) {
     g_sel = -1;
     SaveSettings();
     RefreshGames();
+    RebuildPool(false);
     Relayout(hwnd);
 }
 

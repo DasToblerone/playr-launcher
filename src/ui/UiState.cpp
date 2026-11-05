@@ -13,6 +13,7 @@ Bitmap* g_avatar = nullptr;        // the Steam profile picture
 Bitmap* g_avatarBaked = nullptr;   // it, round and scaled for the top bar
 int g_avatarSize = 0;
 
+Page g_page = Page::Randomizer;
 float g_scale = 1.0f;
 Layout g_L;
 Hover g_hover;

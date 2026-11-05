@@ -4,7 +4,10 @@
 #include <cmath>
 
 #include "model/Library.h"
+#include "ui/DrawPrimitives.h"
 #include "ui/Feedback.h"
+#include "ui/LibraryLayout.h"
+#include "ui/Randomizer.h"
 #include "ui/UiState.h"
 
 using namespace Gdiplus;
@@ -13,45 +16,88 @@ namespace playr {
 
 namespace {
 
-// Case-insensitive "contains", for the search field.
-bool NameContains(const std::wstring& name, const std::wstring& needle) {
-    auto lower = [](std::wstring text) {
-        if (!text.empty()) CharLowerBuffW(text.data(), (DWORD)text.size());
-        return text;
-    };
-    return lower(name).find(lower(needle)) != std::wstring::npos;
+constexpr float kCenterScale = 1.08f;  // the card in the middle is drawn this much larger
+
+int TextWidth(Graphics& g, const std::wstring& text) {
+    RectF box;
+    g.MeasureString(text.c_str(), -1, &CachedFont((REAL)S(13), true), PointF(0, 0), StringFormat::GenericTypographic(), &box);
+    return (int)std::ceil(box.Width);
+}
+
+// Lays the chips of one group out in lines that wrap at `maxRight`; returns the bottom of the last line.
+int FlowChips(Graphics& g, int group, int startX, int top, int maxRight, int maxLines) {
+    int height = S(kChipHeight), x = startX, y = top, lines = 1;
+    int count = group == 0 ? kPlayFilterCount : (int)g_categories.size();
+    for (int i = 0; i < count; ++i) {
+        std::wstring label = group == 0 ? PlayFilterName((PlayFilter)i) : g_categories[i];
+        int width = std::min(TextWidth(g, label) + S(32), S(kChipMaxWidth));
+        if (x + width > maxRight && x > startX) {
+            if (++lines > maxLines) break;
+            x = startX;
+            y += height + S(kChipGap);
+        }
+        ChipHit chip;
+        chip.r = { x, y, x + width, y + height };
+        chip.group = group;
+        chip.value = i;
+        chip.label = label;
+        g_L.rollChips.push_back(chip);
+        x += width + S(kChipGap);
+    }
+    return y + height;
+}
+
+// The randomizer page: the filters on top, the reel with the result under them.
+void LayoutRandomizer(HWND hwnd, int W, int H) {
+    int gap = S(kPanelGap), top = S(kTopBar);
+    g_L.panel = { gap, top, W - gap, std::max(top + S(200), H - gap) };
+    g_L.toastBottom = g_L.panel.bottom - S(24);
+    int pad = S(kPanelPad), left = g_L.panel.left + pad, right = g_L.panel.right - pad;
+
+    // Filters: the play-time chips with the switch at the right, then the collections.
+    g_L.rollChips.clear();
+    Graphics g(hwnd);
+    int height = S(kChipHeight), labelW = S(kLabelWidth);
+    int y = g_L.panel.top + S(22);
+    int toggleW = S(190);
+    g_L.rollToggle = { right - toggleW, y, right, y + height };
+    g_L.labelX = left;
+    g_L.labelH = height;
+    g_L.labelY[0] = y;
+    int filtersBottom = FlowChips(g, 0, left + labelW, y, right - toggleW - S(16), 3);
+    g_L.labelY[1] = -1;
+    if (g_categories.size() > 1) {
+        g_L.labelY[1] = filtersBottom + S(10);
+        filtersBottom = FlowChips(g, 1, left + labelW, g_L.labelY[1], right, 2);
+    }
+
+    // The stage: the reel with the result under it, centered in the space that is left.
+    int stageTop = filtersBottom + S(24), stageBottom = g_L.panel.bottom;
+    g_L.stage = { g_L.panel.left, stageTop, g_L.panel.right, stageBottom };
+    int infoH = S(128), between = S(20), frame = S(18);
+    int stageH = stageBottom - stageTop;
+    g_L.reelCardH = std::clamp(stageH - infoH - between - 2 * frame, S(120), S(340));
+    g_L.reelCardW = g_L.reelCardH * 2 / 3;
+    int blockH = g_L.reelCardH + 2 * frame + between + infoH;
+    int blockTop = stageTop + std::max(0, (stageH - blockH) / 2);
+    g_L.reel = { g_L.panel.left, blockTop, g_L.panel.right, blockTop + g_L.reelCardH + 2 * frame };
+    g_L.centerX = (g_L.panel.left + g_L.panel.right) / 2;
+    g_L.centerY = blockTop + frame + g_L.reelCardH / 2;
+
+    int infoTop = g_L.reel.bottom + between;
+    g_L.name = { left, infoTop, right, infoTop + S(38) };
+    g_L.stats = { left, infoTop + S(40), right, infoTop + S(62) };
+    int buttonTop = infoTop + S(78), buttonH = S(46), cx = g_L.centerX;
+    g_L.act[ACT_ROLL] = { cx - S(130), buttonTop, cx + S(130), buttonTop + buttonH };
+    g_L.act[ACT_START] = { cx - S(200), buttonTop, cx - S(6), buttonTop + buttonH };
+    g_L.act[ACT_AGAIN] = { cx + S(6), buttonTop, cx + S(200), buttonTop + buttonH };
 }
 
 }  // namespace
 
-void RefreshGames() {
-    const std::wstring& filter = SelectedCategory();
-    g_visible.clear();
-    bool selectionVisible = false;
-    for (int i = 0; i < (int)g_games.size(); ++i) {
-        if (filter != kAllGames && !g_games[i].InCategory(filter)) continue;
-        if (!g_showUninstalled && !g_games[i].installed) continue;
-        if (!g_search.empty() && !NameContains(g_games[i].name, g_search)) continue;
-        g_visible.push_back(i);
-        selectionVisible |= i == g_sel;
-    }
-    // Numbers sort largest first by default; ties and names fall back to the alphabet.
-    std::stable_sort(g_visible.begin(), g_visible.end(), [](int a, int b) {
-        const Game& x = g_games[a];
-        const Game& y = g_games[b];
-        long long keyX = 0, keyY = 0;
-        switch (g_sortKey) {
-        case SortKey::Playtime: keyX = x.playtimeMinutes; keyY = y.playtimeMinutes; break;
-        case SortKey::LastPlayed: keyX = x.lastPlayed; keyY = y.lastPlayed; break;
-        case SortKey::Size: keyX = x.sizeBytes; keyY = y.sizeBytes; break;
-        case SortKey::Name: break;
-        }
-        if (keyX != keyY) return g_sortDescending ? keyX > keyY : keyX < keyY;
-        int byName = _wcsicmp(x.name.c_str(), y.name.c_str());
-        return g_sortKey == SortKey::Name && g_sortDescending ? byName > 0 : byName < 0;
-    });
-    if (!selectionVisible) g_sel = -1;
-    ClampScroll();
+RECT CenterCard() {
+    int w = (int)(g_L.reelCardW * kCenterScale), h = (int)(g_L.reelCardH * kCenterScale);
+    return { g_L.centerX - w / 2, g_L.centerY - h / 2, g_L.centerX + w / 2, g_L.centerY + h / 2 };
 }
 
 void Relayout(HWND hwnd) {
@@ -59,128 +105,66 @@ void Relayout(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     int W = rc.right, H = rc.bottom;
 
-    // Two rounded panels on a black window, like Spotify: the library on the left, the games on the right.
-    int gap = S(kPanelGap), panelBottom = H - S(kBarHeight);
-    g_L.bar = { 0, panelBottom, W, H };
+    // The top bar is shared: account, tabs, then the search field (library) or the actions (randomizer).
     int top = S(kTopBar);
     g_L.topBar = { 0, 0, W, top };
     int captionW = S(46), captionH = S(32);
     for (int i = 0; i < 3; ++i)
         g_L.caption[i] = { W - (3 - i) * captionW, 0, W - (2 - i) * captionW, captionH };
-    // The search field sits in the middle of the top bar, like Spotify's.
-    int searchW = std::clamp(W - 2 * S(300), S(220), S(520)), searchH = S(44), searchTop = (top - searchH) / 2;
-    g_L.search = { (W - searchW) / 2, searchTop, (W + searchW) / 2, searchTop + searchH };
-    int clearSize = S(28);
-    g_L.searchClear = { g_L.search.right - S(10) - clearSize, searchTop + (searchH - clearSize) / 2,
-        g_L.search.right - S(10), searchTop + (searchH - clearSize) / 2 + clearSize };
-    if (g_searchEdit) {
-        int eh = S(18), left = g_L.search.left + S(48);
-        SetWindowPos(g_searchEdit, nullptr, left, searchTop + (searchH - eh) / 2,
-            g_L.searchClear.left - S(6) - left, eh, SWP_NOZORDER);
-    }
-    g_L.sidebar = { gap, top, gap + S(kSidebarWidth), std::max(top + S(100), panelBottom - S(4)) };
-    g_L.main = { g_L.sidebar.right + gap, top, W - gap, g_L.sidebar.bottom };
-    g_L.sideList = { g_L.sidebar.left, g_L.sidebar.top + S(kSideHeader), g_L.sidebar.right, g_L.sidebar.bottom - S(8) };
-    int createW = S(104), createH = S(34);
-    g_L.create = { g_L.sidebar.right - S(12) - createW, g_L.sidebar.top + (S(kSideHeader) - createH) / 2,
-        g_L.sidebar.right - S(12), g_L.sidebar.top + (S(kSideHeader) - createH) / 2 + createH };
-    int sortW = S(200), sortH = S(34);
-    g_L.sortBtn = { g_L.main.right - S(kMargin) - sortW, g_L.main.top + S(24), g_L.main.right - S(kMargin),
-        g_L.main.top + S(24) + sortH };
-    // In a narrow panel the switch loses its label to leave room for the category title.
-    int toggleW = g_L.main.right - g_L.main.left < S(760) ? S(48) : S(176);
-    g_L.toggle = { g_L.sortBtn.left - S(16) - toggleW, g_L.sortBtn.top, g_L.sortBtn.left - S(16), g_L.sortBtn.bottom };
-    int listTop = g_L.main.top + S(kMainHeader);
-    g_L.list = { g_L.main.left, listTop, g_L.main.right, std::max(listTop, (int)g_L.main.bottom - S(8)) };
 
-    int mainWidth = g_L.main.right - g_L.main.left;
-    g_L.rowH = S(kRowHeight);
-    g_L.cols = 1;
-    g_L.grid = mainWidth >= S(kGridMinWidth);
-    if (g_L.grid) {
-        // Portrait art in a grid; the cells stretch so the columns fill the panel.
-        g_L.cardPad = S(kCardPad);
-        g_L.cardGap = S(kCardGap);
-        int available = mainWidth - 2 * (S(kMargin) - g_L.cardPad);
-        g_L.cols = std::max(1, (available + g_L.cardGap) / (S(kCardTargetWidth) + g_L.cardGap));
-        g_L.cellW = (available - g_L.cardGap * (g_L.cols - 1)) / g_L.cols;
-        g_L.artW = g_L.cellW - 2 * g_L.cardPad;
-        g_L.artH = g_L.artW * 3 / 2;
-        g_L.cellH = g_L.cardPad + g_L.artH + S(10) + S(kCardTextHeight) + g_L.cardPad;
-        g_L.rowH = g_L.cellH + g_L.cardGap;
-    }
-    g_L.wheelStep = g_L.grid ? g_L.rowH / 3 : g_L.rowH;
-    // The categories are rows of the sidebar, which scrolls on its own when there are many.
-    ClampSideScroll();
-    g_L.chips.clear();
-    for (int i = 0; i < (int)g_categories.size(); ++i) {
-        int top = g_L.sideList.top + i * S(kSideRow) - g_sideScroll;
-        g_L.chips.push_back({ g_L.sidebar.left + S(8), top, g_L.sidebar.right - S(8), top + S(kSideRow) });
+    int tabH = S(kTabHeight), tabW = S(kTabWidth), tabTop = (top - tabH) / 2, x = S(kTabsLeft);
+    for (int i = 0; i < 2; ++i) {
+        g_L.tab[i] = { x, tabTop, x + tabW, tabTop + tabH };
+        x += tabW + S(kGap);
     }
 
-    int ph = S(kControlHeight);
-    int py = g_L.bar.top + (S(kBarHeight) - ph) / 2;
-    // The buttons live in a column of at most 1300 pixels that stays centered, so they are easy to find in a big window.
-    int margin = std::max(S(kBarMargin), (W - S(1300)) / 2);
-    int x = margin;
-    for (int i = 0; i < BTN_RANDOM; ++i) {
-        g_L.btn[i] = { x, py, x + S(kButtonWidths[i]), py + ph };
-        x += S(kButtonWidths[i]) + S(kGap);
+    bool library = g_page == Page::Library;
+    g_L.search = g_L.searchClear = {};
+    for (RECT& button : g_L.btn) button = {};
+    if (library) {
+        int searchH = S(44), searchTop = (top - searchH) / 2, left = x + S(16);
+        int width = std::clamp((int)g_L.caption[0].left - S(16) - left, S(180), S(520));
+        g_L.search = { left, searchTop, left + width, searchTop + searchH };
+        int clearSize = S(28);
+        g_L.searchClear = { g_L.search.right - S(10) - clearSize, searchTop + (searchH - clearSize) / 2,
+            g_L.search.right - S(10), searchTop + (searchH - clearSize) / 2 + clearSize };
+        if (g_searchEdit) {
+            int eh = S(18), editLeft = g_L.search.left + S(48);
+            SetWindowPos(g_searchEdit, nullptr, editLeft, searchTop + (searchH - eh) / 2,
+                g_L.searchClear.left - S(6) - editLeft, eh, SWP_NOZORDER);
+        }
+    } else {
+        int bh = S(kTopButtonHeight), by = (top - bh) / 2, bx = g_L.caption[0].left - S(12);
+        for (int i = BTN_COUNT - 1; i >= 0; --i) {
+            int w = S(kButtonWidths[i]);
+            g_L.btn[i] = { bx - w, by, bx, by + bh };
+            bx -= w + S(kGap);
+        }
     }
-    g_L.btn[BTN_RANDOM] = { W - margin - S(kRandomWidth), py, W - margin, py + ph };
+    if (g_searchEdit) ShowWindow(g_searchEdit, library ? SW_SHOW : SW_HIDE);
 
-    if (g_renameEdit && g_renameChip >= 0 && g_renameChip < (int)g_L.chips.size()) {
-        RECT field = RenameRect(g_renameChip);
-        int eh = S(18);
-        SetWindowPos(g_renameEdit, HWND_TOP, field.left + S(10), field.top + (field.bottom - field.top - eh) / 2,
-            field.right - field.left - S(20), eh, SWP_SHOWWINDOW);
-    }
-    ClampScroll();
-    ClampSideScroll();
+    if (library) LayoutLibrary(hwnd, W, H);
+    else LayoutRandomizer(hwnd, W, H);
+
     if (g_toast.active) LayoutToast(hwnd);
     Redraw(hwnd);
 }
 
-// Geometry of item `i` (visible index): a list row, or a card in the grid.
-int ItemTop(int i) { return g_L.list.top + (i / g_L.cols) * g_L.rowH - g_scroll; }
-
-RECT ItemCell(int i) {
-    int top = ItemTop(i);
-    if (!g_L.grid) return { (int)g_L.list.left, top, (int)g_L.list.right, top + g_L.rowH };
-    int left = g_L.list.left + S(kMargin) - g_L.cardPad + (i % g_L.cols) * (g_L.cellW + g_L.cardGap);
-    return { left, top, left + g_L.cellW, top + g_L.cellH };
-}
-
-RECT ArtRect(int i) {
-    RECT cell = ItemCell(i);
-    if (g_L.grid) {
-        int left = cell.left + g_L.cardPad, top = cell.top + g_L.cardPad;
-        return { left, top, left + g_L.artW, top + g_L.artH };
+// Switches the tab. A rename in progress and an open menu do not carry over to the other page.
+void SetPage(HWND hwnd, Page page) {
+    if (page == g_page) return;
+    if (g_renameChip >= 0) {
+        g_renameChip = -1;
+        ShowWindow(g_renameEdit, SW_HIDE);
     }
-    int left = cell.left + S(kRowInset) + S(kNumberColumn);
-    int top = cell.top + S(2) + (g_L.rowH - S(4) - S(kCoverHeight)) / 2;
-    return { left, top, left + S(kCoverWidth), top + S(kCoverHeight) };
-}
-
-// The area that starts the game when clicked: the whole cover in the list, the round button on a card.
-RECT PlayRect(int i) {
-    RECT art = ArtRect(i);
-    if (!g_L.grid) return art;
-    int d = S(44), inset = S(8);
-    return { art.right - inset - d, art.bottom - inset - d, art.right - inset, art.bottom - inset };
-}
-
-bool InPlayZone(int i, POINT p) {
-    if (i < 0 || !g_games[g_visible[i]].installed) return false;  // games that are not installed cannot be started
-    RECT r = PlayRect(i);
-    return In(r, p);
-}
-
-void EnsureVisible(int visibleIndex) {
-    int top = (visibleIndex / g_L.cols) * g_L.rowH, view = g_L.list.bottom - g_L.list.top;
-    if (top < g_scroll) g_scroll = top;
-    else if (top + g_L.rowH > g_scroll + view) g_scroll = top + g_L.rowH - view;
-    ClampScroll();
+    g_menu.open = false;
+    g_drag = DragState{};
+    if (GetCapture() == hwnd) ReleaseCapture();
+    g_hover = Hover{};
+    g_page = page;
+    if (page == Page::Library) RefreshGames();
+    SetFocus(hwnd);
+    Relayout(hwnd);
 }
 
 }  // namespace playr

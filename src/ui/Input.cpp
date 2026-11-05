@@ -7,20 +7,58 @@
 #include "storage/Storage.h"
 #include "ui/Categories.h"
 #include "ui/ContextMenu.h"
+#include "ui/Feedback.h"
 #include "ui/Format.h"
 #include "ui/GameActions.h"
 #include "ui/HitTest.h"
 #include "ui/Layout.h"
 #include "ui/MainWindow.h"
+#include "ui/Randomizer.h"
+#include "ui/Sound.h"
 #include "ui/UiState.h"
 
 using namespace Gdiplus;
 
 namespace playr {
 
-void OnMouseDown(HWND hwnd, UINT msg, LPARAM lp) {
-    SetFocus(hwnd);
-    POINT p = ClientPoint(lp);
+namespace {
+
+void OnRollFilterChanged(HWND hwnd) {
+    g_hover = Hover{};
+    RebuildPool(true);
+    SaveSettings();
+    Redraw(hwnd);
+}
+
+void ActivateResult(HWND hwnd) {
+    if (const Game* game = ResultGame()) ActivateGame(hwnd, *game);
+}
+
+void MouseDownRandomizer(HWND hwnd, UINT msg, POINT p) {
+    if (In(g_L.rollToggle, p)) {
+        g_rollUninstalled = !g_rollUninstalled;
+        OnRollFilterChanged(hwnd);
+        return;
+    }
+    int chip = HitRollChip(p), button = HitButton(p), action = HitAction(p);
+    if (chip >= 0) {
+        const ChipHit& hit = g_L.rollChips[chip];
+        if (hit.group == 0) g_playFilter = (PlayFilter)hit.value;
+        else g_poolCategory = hit.value;
+        OnRollFilterChanged(hwnd);
+    } else if (button >= 0) {
+        SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(ID_ACTION + button, BN_CLICKED), 0);
+    } else if (action == ACT_ROLL || action == ACT_AGAIN) {
+        StartSpin(hwnd);
+        Redraw(hwnd);
+    } else if (action == ACT_START) {
+        ActivateResult(hwnd);
+    } else if (msg == WM_LBUTTONDBLCLK && HitCard(p)) {
+        ActivateResult(hwnd);
+    }
+}
+
+void MouseDownLibrary(HWND hwnd, UINT msg, POINT p) {
     if (!g_search.empty() && In(g_L.searchClear, p)) {
         SetWindowTextW(g_searchEdit, L"");
         return;
@@ -42,6 +80,7 @@ void OnMouseDown(HWND hwnd, UINT msg, LPARAM lp) {
             g_games[menu.game].RemoveCategory(g_categories[menu.chip]);
             SaveSettings();
             RefreshGames();
+            RebuildPool(false);
             Redraw(hwnd);
             break;
         default: SelectSort(hwnd, SortKeyOf(menu.actions[picked])); break;
@@ -86,6 +125,20 @@ void OnMouseDown(HWND hwnd, UINT msg, LPARAM lp) {
     }
 }
 
+}  // namespace
+
+void OnMouseDown(HWND hwnd, UINT msg, LPARAM lp) {
+    SetFocus(hwnd);
+    POINT p = ClientPoint(lp);
+    int tab = HitTab(p);
+    if (tab >= 0) {
+        SetPage(hwnd, (Page)tab);
+        return;
+    }
+    if (g_page == Page::Randomizer) MouseDownRandomizer(hwnd, msg, p);
+    else MouseDownLibrary(hwnd, msg, p);
+}
+
 void OnMouseMove(HWND hwnd, WPARAM wp, LPARAM lp) {
     if (!g_tracking) {
         TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE, hwnd, 0 };
@@ -110,6 +163,24 @@ void OnKeyDown(HWND hwnd, WPARAM key) {
         ToggleFullscreen(hwnd);
         return;
     }
+    if (key == 'M') {  // the spin's sound on and off
+        g_soundOn = !g_soundOn;
+        if (!g_soundOn) StopSpinSound();
+        SaveSettings();
+        ShowToast(hwnd, g_soundOn ? L"Ton an" : L"Ton aus");
+        return;
+    }
+    if (g_page == Page::Randomizer) {  // space draws again, Enter starts the game that was drawn
+        if (key == VK_SPACE) {
+            if (StartSpin(hwnd)) Redraw(hwnd);
+        } else if (key == VK_RETURN && !Spinning()) {
+            ActivateResult(hwnd);
+        } else if (key == VK_ESCAPE && g_fullscreen) {
+            ToggleFullscreen(hwnd);
+        }
+        return;
+    }
+
     if (key == 'F' && GetKeyState(VK_CONTROL) < 0) {  // Ctrl+F jumps to the search field
         SetFocus(g_searchEdit);
         return;

@@ -32,6 +32,6 @@ void DrawIcon(Gdiplus::Graphics& g, Icon icon, Gdiplus::REAL cx, Gdiplus::REAL c
 
 // Icon and label as one group, centered in a button.
 void DrawButtonContent(Gdiplus::Graphics& g, Gdiplus::RectF r, Icon icon, const std::wstring& text,
-    const Gdiplus::Color& color);
+    const Gdiplus::Color& color, Gdiplus::REAL px = 13);
 
 }  // namespace playr

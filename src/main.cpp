@@ -1,8 +1,8 @@
 // PLAYR-Launcher
 //
-// Lists your installed Steam games, launches the one you click, or picks one at random. Games are read from the local Steam
-// libraries, cover art comes from Steam's CDN, and everything is drawn with GDI+ in a dark
-// Spotify-like style with a purple accent.
+// A Steam game randomizer: it rolls a game from your library, with filters for what may come up, and starts it with one
+// click. Games are read from the local Steam libraries, cover art comes from Steam's CDN, and everything is drawn with
+// GDI+ in a dark style with a purple accent.
 
 #include "platform/Gdi.h"
 

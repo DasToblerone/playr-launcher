@@ -12,6 +12,10 @@ void DrawSearchField(Gdiplus::Graphics& g);
 void DrawUninstalledToggle(Gdiplus::Graphics& g);
 void DrawSortButton(Gdiplus::Graphics& g);
 void DrawBar(Gdiplus::Graphics& g, int W, int H);
+void DrawActionButtons(Gdiplus::Graphics& g);  // the randomizer's scan and import buttons in the top bar
+void DrawTabs(Gdiplus::Graphics& g);
+void DrawFilters(Gdiplus::Graphics& g);
+void DrawStage(Gdiplus::Graphics& g);
 void DrawDragGhost(Gdiplus::Graphics& g);
 void DrawMenu(Gdiplus::Graphics& g);
 void DrawToast(Gdiplus::Graphics& g);

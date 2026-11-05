@@ -134,22 +134,36 @@ void DrawIcon(Graphics& g, Icon icon, REAL cx, REAL cy, REAL size, const Color& 
         g.DrawLines(&pen, tray, 4);
         break;
     }
+    case Icon::Dice: {  // a die showing five
+        REAL half = h * 0.9f;
+        GraphicsPath outline;
+        RoundPath(outline, RectF(cx - half, cy - half, 2 * half, 2 * half), half * 0.38f);
+        g.DrawPath(&pen, &outline);
+        SolidBrush brush(color);
+        REAL pip = size * 0.075f, step = half * 0.5f;
+        for (REAL dx : { -step, 0.0f, step })
+            for (REAL dy : { -step, 0.0f, step })
+                if ((dx == 0) == (dy == 0)) g.FillEllipse(&brush, cx + dx - pip, cy + dy - pip, 2 * pip, 2 * pip);
+        break;
+    }
+    case Icon::Play:
+        DrawPlayTriangle(g, cx, cy, size * 0.8f, color);
+        break;
     case Icon::None:
         break;
     }
 }
 
 // Icon and label as one group, centered in a button.
-void DrawButtonContent(Graphics& g, RectF r, Icon icon, const std::wstring& text, const Color& color) {
-    FontFamily family(L"Arial");
-    Font font(&family, (REAL)S(13), FontStyleBold, UnitPixel);
+void DrawButtonContent(Graphics& g, RectF r, Icon icon, const std::wstring& text, const Color& color, REAL px) {
+    REAL scale = px / 13.0f;
     RectF box;
-    g.MeasureString(text.c_str(), -1, &font, PointF(0, 0), &box);
-    REAL iconW = icon == Icon::None ? 0.0f : (REAL)S(16), gap = icon == Icon::None ? 0.0f : (REAL)S(8);
-    REAL textW = box.Width - S(8);
+    g.MeasureString(text.c_str(), -1, &CachedFont((REAL)S(px), true), PointF(0, 0), StringFormat::GenericTypographic(), &box);
+    REAL iconW = icon == Icon::None ? 0.0f : (REAL)S(16 * scale), gap = icon == Icon::None ? 0.0f : (REAL)S(8 * scale);
+    REAL textW = std::ceil(box.Width);
     REAL startX = r.X + (r.Width - (iconW + gap + textW)) / 2;
     DrawIcon(g, icon, startX + iconW / 2, r.Y + r.Height / 2, iconW, color);
-    DrawLabel(g, text, (REAL)S(13), true, color,
+    DrawLabel(g, text, (REAL)S(px), true, color,
         RectF(startX + iconW + gap, r.Y, textW + S(12), r.Height), StringAlignmentNear, StringAlignmentCenter);
 }
 

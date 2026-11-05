@@ -20,7 +20,7 @@ void LayoutToast(HWND hwnd) {
     GetClientRect(hwnd, &client);
     int pad = S(22), h = S(46);
     int w = std::min(pad * 2 + (int)std::ceil(textBox.Width) + S(2), (int)client.right - S(32));
-    int x = (client.right - w) / 2, y = g_L.bar.top - S(14) - h;
+    int x = (client.right - w) / 2, y = g_L.toastBottom - h;
     g_toast.rect = { x, y, x + w, y + h };
 }
 

@@ -16,7 +16,7 @@ struct BakedArt {
 };
 using BakedCache = std::map<unsigned long long, BakedArt>;
 
-extern BakedCache g_bakedRows, g_bakedCards, g_bakedTilesSmall, g_bakedTilesFull;
+extern BakedCache g_bakedRows, g_bakedCards, g_bakedTilesSmall, g_bakedTilesFull, g_bakedReel;
 
 // The full-size art of a game, loaded lazily; null while the file is missing.
 Gdiplus::Bitmap* GetCover(const std::wstring& appId);

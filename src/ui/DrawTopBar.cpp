@@ -44,11 +44,22 @@ void DrawTopBar(Graphics& g) {
         DrawCentered(g, name.substr(0, 1), (REAL)S(18), true, kOnAccent, circle);
     }
 
-    REAL tx = circle.GetRight() + S(12), tw = (REAL)S(kSidebarWidth) - S(avatar / g_scale + 12);
-    DrawLabel(g, name, (REAL)S(16), true, kText, RectF(tx, cy - S(20), tw + S(200), (REAL)S(22)));
+    REAL tx = circle.GetRight() + S(12), tw = (REAL)(S(kTabsLeft) - S(12)) - tx;  // the name ends before the tabs
+    DrawLabel(g, name, (REAL)S(16), true, kText, RectF(tx, cy - S(20), tw, (REAL)S(22)));
     size_t installedCount = std::count_if(g_games.begin(), g_games.end(), [](const Game& game) { return game.installed; });
     DrawLabel(g, std::to_wstring(installedCount) + (installedCount == 1 ? L" Spiel installiert" : L" Spiele installiert"),
-        (REAL)S(13), false, kText2, RectF(tx, cy + S(1), tw + S(200), (REAL)S(18)));
+        (REAL)S(13), false, kText2, RectF(tx, cy + S(1), tw, (REAL)S(18)));
+}
+
+// The two tabs: the open one is a white pill, the other one a dark pill that lights up on hover.
+void DrawTabs(Graphics& g) {
+    for (int i = 0; i < 2; ++i) {
+        RectF r = RF(g_L.tab[i]);
+        bool active = (int)g_page == i, hover = g_hover.tab == i;
+        Color fill = active ? kText : (hover ? kChipHover : kSurface);
+        FillRound(g, r, r.Height / 2, fill);
+        DrawCentered(g, kTabLabels[i], (REAL)S(14), true, active ? kOnAccent : kText, r);
+    }
 }
 
 // Minimize, maximize (or restore) and close, drawn like Windows' own buttons.

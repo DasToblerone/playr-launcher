@@ -4,6 +4,8 @@
 #include <fstream>
 
 #include "model/Library.h"
+#include "ui/Randomizer.h"
+#include "ui/Sound.h"
 #include "util/Text.h"
 
 namespace playr {
@@ -28,6 +30,9 @@ void SaveSettings() {
     }
     file << "S\t" << (int)g_sortKey << '\t' << (g_sortDescending ? 1 : 0) << "\r\n";
     file << "U\t" << (g_showUninstalled ? 1 : 0) << "\r\n";
+    file << "P\t" << (int)g_playFilter << "\r\n";
+    file << "N\t" << (g_rollUninstalled ? 1 : 0) << "\r\n";
+    file << "M\t" << (g_soundOn ? 1 : 0) << "\r\n";
     for (const auto& game : g_games) {
         for (const auto& category : game.categories) {  // one line per membership
             file << "G\t";
@@ -53,6 +58,13 @@ void LoadSettings() {
             g_sortDescending = split != std::wstring::npos && line.compare(split + 1, 1, L"1") == 0;
         } else if (line.rfind(L"U\t", 0) == 0) {
             g_showUninstalled = line.compare(2, 1, L"0") != 0;
+        } else if (line.rfind(L"P\t", 0) == 0) {
+            int filter = _wtoi(line.substr(2).c_str());
+            if (filter >= 0 && filter < kPlayFilterCount) g_playFilter = (PlayFilter)filter;
+        } else if (line.rfind(L"N\t", 0) == 0) {
+            g_rollUninstalled = line.compare(2, 1, L"1") == 0;
+        } else if (line.rfind(L"M\t", 0) == 0) {
+            g_soundOn = line.compare(2, 1, L"0") != 0;
         } else if (line.rfind(L"G\t", 0) == 0) {
             size_t split = line.find(L'\t', 2);
             if (split == std::wstring::npos) return;

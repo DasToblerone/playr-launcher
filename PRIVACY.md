@@ -13,7 +13,7 @@ Die App liest ausschließlich lesend aus dem Ordner deiner Steam-Installation:
 - die Liste deiner Bibliotheksordner und der installierten Spiele,
 - den Namen und die SteamID64 des zuletzt angemeldeten Steam-Kontos sowie sein Profilbild aus dem Steam-Cache,
 - Spielzeit, zuletzt gespielt und Erfolgsstände aus Steams lokalen Dateien,
-- deine Steam-Sammlungen, wenn du „Kategorien aus Steam“ benutzt.
+- deine Steam-Sammlungen, wenn du „Steam-Sammlungen“ benutzt.
 
 Diese Daten bleiben auf deinem Rechner und werden nur zur Anzeige verwendet. Name und SteamID64 werden nicht ins Netz gesendet.
 
@@ -21,7 +21,7 @@ Diese Daten bleiben auf deinem Rechner und werden nur zur Anzeige verwendet. Nam
 
 Unter `%APPDATA%\PLAYR-Launcher` legt die App ab:
 
-- `settings.txt`: deine Kategorien, Zuordnungen und Sortierung,
+- `settings.txt`: deine Kategorien, Zuordnungen, Sortierung und die Filter des Würfels,
 - `types.txt` und `owned.txt`: zwischengespeicherte Auskünfte des Steam-Stores (ob eine App ein Spiel ist, Namen nicht installierter Spiele),
 - `covers\`: heruntergeladene Titelbilder.
 

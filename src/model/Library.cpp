@@ -12,7 +12,7 @@ bool g_sortDescending = false;
 bool g_showUninstalled = true;
 
 std::vector<Game> g_games;
-std::vector<std::wstring> g_categories{ kAllGames };  // sidebar rows; "Alle Spiele" is always the first
+std::vector<std::wstring> g_categories{ kAllGames };  // sidebar rows and collections to draw from; "Alle Spiele" is always the first
 std::map<std::wstring, bool> g_isGame;   // appId -> verdict from the Steam store, cached on disk
 std::map<std::wstring, std::wstring> g_ownedNames;  // appId -> name of owned games that are not installed, cached on disk
 
